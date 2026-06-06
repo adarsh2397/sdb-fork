@@ -716,7 +716,35 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   {
     std::shared_ptr<sirius::io::s3::s3_request_authorizer> gcs_provider;
 
-    if (config_.gcs_config.use_metadata_server) {
+    if (!config_.gcs_config.static_bearer_token.empty()) {
+      // Static token — debugging only. Captures the token by value into the
+      // authorizer lambda. Expires after ~1 hour; rebuild/restart to refresh.
+      struct static_token_authorizer final : public sirius::io::s3::s3_request_authorizer {
+        std::string token;
+        std::string scheme;
+        std::string host;
+        explicit static_token_authorizer(std::string t, std::string s, std::string h)
+          : token(std::move(t)), scheme(std::move(s)), host(std::move(h)) {}
+        sirius::io::s3::s3_authorized_request authorize(
+          sirius::io::s3::s3_object_ref const& obj,
+          sirius::io::s3::s3_request_method,
+          std::chrono::seconds) override
+        {
+          std::string url = scheme + "://" + host + "/" + obj.bucket + "/" + obj.key;
+          return {std::move(url), {{"Authorization", "Bearer " + token}}};
+        }
+      };
+      // Parse scheme://host from endpoint manually — sirius::io::parse needs
+      // a full URI with path; the endpoint is service-level only.
+      std::string ep  = config_.gcs_config.endpoint;
+      auto sep        = ep.find("://");
+      std::string sch = sep != std::string::npos ? ep.substr(0, sep) : "https";
+      std::string hst = sep != std::string::npos ? ep.substr(sep + 3) : ep;
+      gcs_provider = std::make_shared<static_token_authorizer>(
+        config_.gcs_config.static_bearer_token, std::move(sch), std::move(hst));
+      SIRIUS_LOG_INFO("SiriusContext: GCS backend enabled (static bearer token, endpoint={})",
+                     config_.gcs_config.endpoint);
+    } else if (config_.gcs_config.use_metadata_server) {
       gcs_provider = std::make_shared<sirius::io::gcs::gcs_metadata_server_authorizer>(
         config_.gcs_config.metadata_service_account, config_.gcs_config.endpoint);
       SIRIUS_LOG_INFO(
@@ -736,11 +764,19 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     }
 
     if (gcs_provider) {
+      // Mirror the S3 blocking path: create a thread pool for async range GETs
+      // so column chunks within a row group are fetched in parallel rather than
+      // serially. Uses the same thread pool config as S3 for consistency.
+      gcs_thread_pool_ = std::make_unique<sirius::exec::static_thread_pool>(
+        scan_cfg.s3_thread_pool.num_threads,
+        "gcs-io",
+        scan_cfg.s3_thread_pool.cpu_affinity_list);
       sirius::io::s3::s3_ioctx_config gcs_cfg{};
       gcs_cfg.creds                = std::move(gcs_provider);
       gcs_cfg.ca_bundle_path       = config_.gcs_config.ca_bundle_path;
       gcs_cfg.tls_verify           = config_.gcs_config.tls_verify;
       gcs_cfg.host_memory_resource = host_fsmr;
+      gcs_cfg.async_thread_pool    = gcs_thread_pool_.get();
       gcs_ioctx_ = std::make_shared<sirius::io::gcs::gcs_ioctx>(std::move(gcs_cfg));
     }
   }
@@ -898,7 +934,9 @@ void SiriusContext::terminate()
   s3_ioctx_.reset();
   gcs_ioctx_.reset();
   if (s3_thread_pool_) { s3_thread_pool_->stop(); }
+  if (gcs_thread_pool_) { gcs_thread_pool_->stop(); }
   s3_thread_pool_.reset();
+  gcs_thread_pool_.reset();
   prefetch_buffer_pool_.reset();
 
   // Drop any remaining repositories while the memory manager is still alive.

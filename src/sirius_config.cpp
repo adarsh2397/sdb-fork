@@ -87,6 +87,7 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   r.optional("num_threads", opt.thread_pool.num_threads, yaml::greater_than<int>{0});
   r.optional("thread_name_prefix", opt.thread_pool.thread_name_prefix);
   r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
+  r.optional("s3_io_num_threads", opt.s3_thread_pool.num_threads, yaml::greater_than<int>{0});
   r.optional("use_sirius_datasource", opt.use_sirius_datasource);
   r.optional("uring_n_reactors", opt.uring_n_reactors, yaml::greater_than<std::size_t>{0});
   r.optional("uring_ring_entries", opt.uring_ring_entries, yaml::greater_than<unsigned>{0});
@@ -123,6 +124,7 @@ static void from_yaml(const YAML::Node& node, sirius::io::gcs_object_store_confi
   r.optional("use_metadata_server", opt.use_metadata_server);
   if (opt.metadata_service_account.empty()) opt.metadata_service_account = "default";
   r.optional("metadata_service_account", opt.metadata_service_account);
+  r.optional("static_bearer_token", opt.static_bearer_token);
   r.optional("endpoint", opt.endpoint);
   r.optional("ca_bundle_path", opt.ca_bundle_path);
   r.optional("tls_verify", opt.tls_verify);

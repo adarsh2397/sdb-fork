@@ -139,6 +139,10 @@ struct gcs_object_store_config {
   /// Defaults to "default" which resolves to the VM's primary service account.
   /// Ignored when @c use_metadata_server is false.
   std::string metadata_service_account;
+  /// Static OAuth2 bearer token injected verbatim into every GCS request.
+  /// Intended for debugging only — tokens expire (typically after 1 hour).
+  /// Takes precedence over both @c use_metadata_server and HMAC when non-empty.
+  std::string static_bearer_token;
   /// GCS XML API endpoint. Defaults to the global GCS endpoint; override only for
   /// testing (e.g. a local GCS emulator).
   std::string endpoint = "https://storage.googleapis.com";
