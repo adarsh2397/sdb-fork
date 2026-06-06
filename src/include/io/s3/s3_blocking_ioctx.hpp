@@ -177,7 +177,7 @@ struct s3_ioctx_config {
  *   stacking that the single-task path would exhibit.
  * - **CUDA stream**. Caller-supplied per request on the device-read path.
  */
-class s3_blocking_ioctx final : public sirius_ioctx {
+class s3_blocking_ioctx : public sirius_ioctx {
  public:
   explicit s3_blocking_ioctx(s3_ioctx_config config);
   ~s3_blocking_ioctx() override;
