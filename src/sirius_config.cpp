@@ -115,6 +115,17 @@ static void from_yaml(const YAML::Node& node, sirius::io::object_store_config& o
   r.reject_unknown();
 }
 
+static void from_yaml(const YAML::Node& node, sirius::io::gcs_object_store_config& opt)
+{
+  yaml::reader r(node, "gcs_config");
+  r.optional("hmac_access_key", opt.hmac_access_key);
+  r.optional("hmac_secret_key", opt.hmac_secret_key);
+  r.optional("endpoint", opt.endpoint);
+  r.optional("ca_bundle_path", opt.ca_bundle_path);
+  r.optional("tls_verify", opt.tls_verify);
+  r.reject_unknown();
+}
+
 static void from_yaml(const YAML::Node& node, operator_params& opt)
 {
   yaml::reader r(node, "operator_params");
@@ -391,6 +402,9 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
     if (auto n = r.optional_node("object_store_config")) {
       sirius::from_yaml(*n, object_store_config);
     }
+
+    // GCS config — HMAC credentials for the gs:// datasource.
+    if (auto n = r.optional_node("gcs_config")) { sirius::from_yaml(*n, gcs_config); }
 
     // Telemetry
     if (auto n = r.optional_node("telemetry")) { sirius::from_yaml(*n, _telemetry_config); }

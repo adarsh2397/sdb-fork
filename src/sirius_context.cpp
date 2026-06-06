@@ -24,6 +24,7 @@
 #include "duckdb/planner/planner.hpp"
 #include "exec/thread_pool.hpp"
 #include "io/prefetching_cache.hpp"
+#include "io/gcs/gcs_ioctx.hpp"
 #include "io/s3/s3_blocking_ioctx.hpp"
 #include "io/s3/s3_ioctx.hpp"
 #include "io/s3/sirius_sigv4_authorizer.hpp"
@@ -702,6 +703,31 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
       s3_ioctx_ = std::make_shared<sirius::io::s3::s3_blocking_ioctx>(std::move(s3_cfg));
     }
   }
+  // GCS backend (HMAC / S3-compatible XML API). The GCS endpoint uses the same
+  // SigV4 signing algorithm as S3 — we reuse sirius_sigv4_presigned_authorizer
+  // pointed at storage.googleapis.com with "auto" as the (ignored) region.
+  // Only the blocking backend is used for GCS (no async reactor variant needed
+  // for the HMAC path; add one if throughput demands it).
+  if (!config_.gcs_config.hmac_access_key.empty() &&
+      !config_.gcs_config.hmac_secret_key.empty()) {
+    sirius::io::s3::static_credentials gcs_creds;
+    gcs_creds.access_key_id     = config_.gcs_config.hmac_access_key;
+    gcs_creds.secret_access_key = config_.gcs_config.hmac_secret_key;
+    auto gcs_provider = std::make_shared<sirius::io::s3::sirius_sigv4_presigned_authorizer>(
+      std::move(gcs_creds),
+      "auto",
+      config_.gcs_config.endpoint,
+      std::chrono::minutes{5});
+    sirius::io::s3::s3_ioctx_config gcs_cfg{};
+    gcs_cfg.creds               = std::move(gcs_provider);
+    gcs_cfg.ca_bundle_path      = config_.gcs_config.ca_bundle_path;
+    gcs_cfg.tls_verify          = config_.gcs_config.tls_verify;
+    gcs_cfg.host_memory_resource = host_fsmr;
+    gcs_ioctx_ = std::make_shared<sirius::io::gcs::gcs_ioctx>(std::move(gcs_cfg));
+    SIRIUS_LOG_INFO(
+      "SiriusContext: GCS backend enabled (endpoint={})", config_.gcs_config.endpoint);
+  }
+
   if (scan_cfg.enable_prefetch_cache && host_fsmr != nullptr) {
     auto const slab_bytes = host_fsmr->get_block_size() *
                             static_cast<std::size_t>(sirius::io::buffer_pool::CHUNKS_PER_SLAB);
@@ -724,6 +750,10 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     if (s3_ioctx_) {
       s3_ioctx_->initialize_cache(*prefetch_buffer_pool_, scan_cfg.prefetch_inflight_budget_chunks);
     }
+    if (gcs_ioctx_) {
+      gcs_ioctx_->initialize_cache(*prefetch_buffer_pool_,
+                                   scan_cfg.prefetch_inflight_budget_chunks);
+    }
   }
   // Borrowed routing list for the scan_manager: the default local backend
   // (lowest-GPU uring, matching datasource_registry's kFileScheme target) plus
@@ -741,6 +771,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     borrowed_io_ctxs.push_back(lowest->second);
   }
   if (s3_ioctx_) { borrowed_io_ctxs.push_back(s3_ioctx_); }
+  if (gcs_ioctx_) { borrowed_io_ctxs.push_back(gcs_ioctx_); }
   scan_manager_ = std::make_unique<sirius::scan_manager::sirius_scan_manager>(
     config_.get_scan_manager_config(), std::move(borrowed_io_ctxs));
 
@@ -848,6 +879,7 @@ void SiriusContext::terminate()
   // s3_ioctx is gone, stop/reset the pool, then release the buffer_pool LAST
   // (both the s3 cache and the per-NUMA uring caches reference it).
   s3_ioctx_.reset();
+  gcs_ioctx_.reset();
   if (s3_thread_pool_) { s3_thread_pool_->stop(); }
   s3_thread_pool_.reset();
   prefetch_buffer_pool_.reset();

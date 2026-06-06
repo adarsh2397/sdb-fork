@@ -114,4 +114,24 @@ inline bool enum_to_string(object_store_config::signing_mode m, std::string& s)
   return false;
 }
 
+/// Configuration for GCS reads via the S3-compatible XML API (HMAC authentication).
+/// The GCS backend is enabled only when both @c hmac_access_key and
+/// @c hmac_secret_key are non-empty. An absent / default-constructed config
+/// leaves GCS disabled.
+struct gcs_object_store_config {
+  /// GCS HMAC key ID (the "access key" shown in Cloud Console → Storage → Settings →
+  /// Interoperability → HMAC keys). Typically starts with "GOOG1E".
+  std::string hmac_access_key;
+  /// GCS HMAC secret corresponding to @c hmac_access_key.
+  std::string hmac_secret_key;
+  /// GCS XML API endpoint. Defaults to the global GCS endpoint; override only for
+  /// testing (e.g. a local GCS emulator).
+  std::string endpoint = "https://storage.googleapis.com";
+  /// PEM CA bundle for TLS verification (CURLOPT_CAINFO). Empty uses the system
+  /// bundle — correct for public GCS. Point at a private CA for local emulators.
+  std::string ca_bundle_path;
+  /// Verify TLS peer + host certificate. Default true; false is INSECURE (dev/test only).
+  bool tls_verify = true;
+};
+
 }  // namespace sirius::io

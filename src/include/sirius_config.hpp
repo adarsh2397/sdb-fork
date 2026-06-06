@@ -151,6 +151,11 @@ struct sirius_config {
   /// and SiriusContext consumes it at initialize() time.
   sirius::io::object_store_config object_store_config{};
 
+  /// GCS backend credentials (HMAC / S3-compatible). Empty @c hmac_access_key /
+  /// @c hmac_secret_key keeps the GCS backend disabled. SiriusContext::initialize()
+  /// reads this to construct the @c gcs_ioctx when credentials are present.
+  sirius::io::gcs_object_store_config gcs_config{};
+
  private:
   /// When @c _memory_space_configs contains more than one GPU memory space,
   /// force @c _scan_manager_config.use_sirius_datasource to true (sirius

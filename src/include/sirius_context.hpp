@@ -369,12 +369,15 @@ class SiriusContext : public ClientContextState {
   // The S3 backend (S6 increment 1: single shared instance), owned here and
   // borrowed by the scan_manager. nullptr when no object_store_config is wired.
   std::shared_ptr<sirius::io::sirius_ioctx> s3_ioctx_;
+  // The GCS backend (HMAC / S3-compatible), owned here and borrowed by the
+  // scan_manager. nullptr when no gcs_config is wired.
+  std::shared_ptr<sirius::io::sirius_ioctx> gcs_ioctx_;
   // Teardown order in terminate(): scan_manager_ (drops borrowed aliases) ->
   // datasource_registry_ -> gpu_ioctxs_ (view, drops references) -> numa_ioctxs_
   // (destroys reactor pools + uring caches under a live CUDA context) ->
-  // s3_ioctx_ (destroys s3 cache) -> s3_thread_pool_ -> prefetch_buffer_pool_
-  // (last, after every cache that references it), all BEFORE memory_manager_
-  // shutdown.
+  // s3_ioctx_ / gcs_ioctx_ (destroy caches) -> s3_thread_pool_ ->
+  // prefetch_buffer_pool_ (last, after every cache that references it),
+  // all BEFORE memory_manager_ shutdown.
   std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> numa_ioctxs_;
   // device_id -> normalized NUMA node id ((-1) -> 0). Computed once at
   // initialize() from get_hw_topology().gpus[].numa_node. get_ioctx_for()
