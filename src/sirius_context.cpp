@@ -25,6 +25,7 @@
 #include "exec/thread_pool.hpp"
 #include "io/prefetching_cache.hpp"
 #include "io/gcs/gcs_ioctx.hpp"
+#include "io/gcs/gcs_oauth2_authorizer.hpp"
 #include "io/s3/s3_blocking_ioctx.hpp"
 #include "io/s3/s3_ioctx.hpp"
 #include "io/s3/sirius_sigv4_authorizer.hpp"
@@ -703,29 +704,45 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
       s3_ioctx_ = std::make_shared<sirius::io::s3::s3_blocking_ioctx>(std::move(s3_cfg));
     }
   }
-  // GCS backend (HMAC / S3-compatible XML API). The GCS endpoint uses the same
-  // SigV4 signing algorithm as S3 — we reuse sirius_sigv4_presigned_authorizer
-  // pointed at storage.googleapis.com with "auto" as the (ignored) region.
-  // Only the blocking backend is used for GCS (no async reactor variant needed
-  // for the HMAC path; add one if throughput demands it).
-  if (!config_.gcs_config.hmac_access_key.empty() &&
-      !config_.gcs_config.hmac_secret_key.empty()) {
-    sirius::io::s3::static_credentials gcs_creds;
-    gcs_creds.access_key_id     = config_.gcs_config.hmac_access_key;
-    gcs_creds.secret_access_key = config_.gcs_config.hmac_secret_key;
-    auto gcs_provider = std::make_shared<sirius::io::s3::sirius_sigv4_presigned_authorizer>(
-      std::move(gcs_creds),
-      "auto",
-      config_.gcs_config.endpoint,
-      std::chrono::minutes{5});
-    sirius::io::s3::s3_ioctx_config gcs_cfg{};
-    gcs_cfg.creds               = std::move(gcs_provider);
-    gcs_cfg.ca_bundle_path      = config_.gcs_config.ca_bundle_path;
-    gcs_cfg.tls_verify          = config_.gcs_config.tls_verify;
-    gcs_cfg.host_memory_resource = host_fsmr;
-    gcs_ioctx_ = std::make_shared<sirius::io::gcs::gcs_ioctx>(std::move(gcs_cfg));
-    SIRIUS_LOG_INFO(
-      "SiriusContext: GCS backend enabled (endpoint={})", config_.gcs_config.endpoint);
+  // GCS backend. Two auth modes:
+  //   1. Metadata server (use_metadata_server=true): fetches a short-lived
+  //      OAuth2 bearer token from the GCE instance metadata server. No key
+  //      management required — the VM's attached service account must have GCS
+  //      read access. Takes precedence when both modes are configured.
+  //   2. HMAC (default): SigV4 presigned URL via the S3-compatible XML API.
+  //      Requires hmac_access_key + hmac_secret_key in gcs_config.
+  //
+  // Only the blocking backend is used for GCS (no async reactor variant needed).
+  {
+    std::shared_ptr<sirius::io::s3::s3_request_authorizer> gcs_provider;
+
+    if (config_.gcs_config.use_metadata_server) {
+      gcs_provider = std::make_shared<sirius::io::gcs::gcs_metadata_server_authorizer>(
+        config_.gcs_config.metadata_service_account, config_.gcs_config.endpoint);
+      SIRIUS_LOG_INFO(
+        "SiriusContext: GCS backend enabled (metadata server auth, service_account={}, endpoint={})",
+        config_.gcs_config.metadata_service_account,
+        config_.gcs_config.endpoint);
+    } else if (!config_.gcs_config.hmac_access_key.empty() &&
+               !config_.gcs_config.hmac_secret_key.empty()) {
+      sirius::io::s3::static_credentials gcs_creds;
+      gcs_creds.access_key_id     = config_.gcs_config.hmac_access_key;
+      gcs_creds.secret_access_key = config_.gcs_config.hmac_secret_key;
+      gcs_provider = std::make_shared<sirius::io::s3::sirius_sigv4_presigned_authorizer>(
+        std::move(gcs_creds), "auto", config_.gcs_config.endpoint, std::chrono::minutes{5});
+      SIRIUS_LOG_INFO(
+        "SiriusContext: GCS backend enabled (HMAC auth, endpoint={})",
+        config_.gcs_config.endpoint);
+    }
+
+    if (gcs_provider) {
+      sirius::io::s3::s3_ioctx_config gcs_cfg{};
+      gcs_cfg.creds                = std::move(gcs_provider);
+      gcs_cfg.ca_bundle_path       = config_.gcs_config.ca_bundle_path;
+      gcs_cfg.tls_verify           = config_.gcs_config.tls_verify;
+      gcs_cfg.host_memory_resource = host_fsmr;
+      gcs_ioctx_ = std::make_shared<sirius::io::gcs::gcs_ioctx>(std::move(gcs_cfg));
+    }
   }
 
   if (scan_cfg.enable_prefetch_cache && host_fsmr != nullptr) {

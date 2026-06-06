@@ -120,6 +120,9 @@ static void from_yaml(const YAML::Node& node, sirius::io::gcs_object_store_confi
   yaml::reader r(node, "gcs_config");
   r.optional("hmac_access_key", opt.hmac_access_key);
   r.optional("hmac_secret_key", opt.hmac_secret_key);
+  r.optional("use_metadata_server", opt.use_metadata_server);
+  if (opt.metadata_service_account.empty()) opt.metadata_service_account = "default";
+  r.optional("metadata_service_account", opt.metadata_service_account);
   r.optional("endpoint", opt.endpoint);
   r.optional("ca_bundle_path", opt.ca_bundle_path);
   r.optional("tls_verify", opt.tls_verify);

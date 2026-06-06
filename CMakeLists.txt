@@ -178,6 +178,7 @@ set(EXTENSION_SOURCES
     src/io/parquet_helpers.cpp
     src/io/prefetching_cache.cpp
     src/io/gcs/gcs_ioctx.cpp
+    src/io/gcs/gcs_oauth2_authorizer.cpp
     src/io/s3/s3_blocking_ioctx.cpp
     src/io/s3/s3_reactor.cpp
     src/io/s3/s3_ioctx.cpp

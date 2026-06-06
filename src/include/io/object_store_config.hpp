@@ -114,16 +114,31 @@ inline bool enum_to_string(object_store_config::signing_mode m, std::string& s)
   return false;
 }
 
-/// Configuration for GCS reads via the S3-compatible XML API (HMAC authentication).
-/// The GCS backend is enabled only when both @c hmac_access_key and
-/// @c hmac_secret_key are non-empty. An absent / default-constructed config
-/// leaves GCS disabled.
+/// Configuration for GCS reads via the S3-compatible XML API.
+///
+/// Two authentication modes are supported (mutually exclusive):
+///   - HMAC: set @c hmac_access_key and @c hmac_secret_key. Requires a key
+///     pair generated in GCS Console → Storage → Settings → Interoperability.
+///   - Metadata server: set @c use_metadata_server = true. Works on GCE VMs
+///     where the attached service account already has GCS bucket access. No
+///     key management required.
+///
+/// The GCS backend is disabled when neither mode is configured.
 struct gcs_object_store_config {
-  /// GCS HMAC key ID (the "access key" shown in Cloud Console → Storage → Settings →
-  /// Interoperability → HMAC keys). Typically starts with "GOOG1E".
+  /// GCS HMAC key ID (typically starts with "GOOG1E"). Ignored when
+  /// @c use_metadata_server is true.
   std::string hmac_access_key;
-  /// GCS HMAC secret corresponding to @c hmac_access_key.
+  /// GCS HMAC secret corresponding to @c hmac_access_key. Ignored when
+  /// @c use_metadata_server is true.
   std::string hmac_secret_key;
+  /// When true, authenticate via the GCE instance metadata server instead of
+  /// HMAC keys. The VM must have a service account attached with GCS read
+  /// access. Takes precedence over HMAC credentials when both are set.
+  bool use_metadata_server = false;
+  /// Service account identifier used in the metadata server token URL.
+  /// Defaults to "default" which resolves to the VM's primary service account.
+  /// Ignored when @c use_metadata_server is false.
+  std::string metadata_service_account;
   /// GCS XML API endpoint. Defaults to the global GCS endpoint; override only for
   /// testing (e.g. a local GCS emulator).
   std::string endpoint = "https://storage.googleapis.com";
