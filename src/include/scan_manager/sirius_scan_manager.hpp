@@ -104,6 +104,23 @@ struct scan_manager_config {
   /// @c enable_prefetch_cache is false (no cache → no prewarm regardless).
   bool enable_chunk_prewarm{true};
 
+  /// Footer/metadata-only cache (Phase C2). When true and @c enable_prefetch_cache
+  /// is false, SiriusContext builds a small pinned-host pool
+  /// (@c metadata_cache_pool_bytes) solely so the @c prefetching_cache exists and
+  /// can persist parsed parquet footers across queries — cache-forever, never
+  /// revalidated (@c get_metadata returns the stored footer with no round-trip).
+  /// Chunk prewarm is forced off in this mode (footers only). This lets the
+  /// network backends (S3/GCS) skip the per-query footer re-fetch without paying
+  /// for the full 20 GiB chunk-prefetch pool. Ignored when
+  /// @c enable_prefetch_cache is true (the full cache already stores metadata).
+  bool enable_metadata_cache{true};
+  /// Pinned-host bytes for the minimal pool backing the metadata-only cache.
+  /// Small by design: footers are tiny and chunk prewarm is off, so the pool is
+  /// effectively unused beyond satisfying the cache's buffer_pool dependency.
+  /// Rounded up to at least one slab. Ignored unless the metadata-only path is
+  /// active (@c enable_metadata_cache && !@c enable_prefetch_cache).
+  std::size_t metadata_cache_pool_bytes{64ULL << 20};
+
   /// S3 backend opt-in. When set, SiriusContext (S6) constructs an @c s3_ioctx
   /// from these credentials/knobs and hands it to the scan_manager as a borrowed
   /// backend (the scan_manager itself constructs nothing). Default construction

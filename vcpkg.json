@@ -16,7 +16,9 @@
     "numactl",
     "liburing",
     "openssl",
-    "curl"
+    "curl",
+    "grpc",
+    "protobuf"
   ],
   "overrides": [
     {

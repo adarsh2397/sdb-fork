@@ -125,6 +125,19 @@ inline bool enum_to_string(object_store_config::signing_mode m, std::string& s)
 ///
 /// The GCS backend is disabled when neither mode is configured.
 struct gcs_object_store_config {
+  /// Read transport. @c xml (default) uses the S3-compatible XML/HTTP API
+  /// (@c gcs_async_ioctx). @c grpc uses the native google.storage.v2 gRPC
+  /// ReadObject backend (@c gcs_grpc_ioctx) — required to exploit DirectPath /
+  /// Rapid (zonal) buckets on a co-located GCE VM. Both reuse the same auth
+  /// (HMAC / metadata-server / static token); gRPC ignores HMAC and uses the
+  /// OAuth2 bearer token as call credentials.
+  enum class transport { xml, grpc };
+  transport gcs_transport = transport::xml;
+  /// gRPC target host for the native backend (no scheme; ":443" appended if no
+  /// port given). Ignored unless @c gcs_transport == grpc. For DirectPath on a
+  /// co-located VM, use "google-c2p:///storage.googleapis.com".
+  std::string grpc_endpoint = "storage.googleapis.com";
+
   /// GCS HMAC key ID (typically starts with "GOOG1E"). Ignored when
   /// @c use_metadata_server is true.
   std::string hmac_access_key;
@@ -152,5 +165,27 @@ struct gcs_object_store_config {
   /// Verify TLS peer + host certificate. Default true; false is INSECURE (dev/test only).
   bool tls_verify = true;
 };
+
+inline bool string_to_enum(std::string_view sv, gcs_object_store_config::transport& t)
+{
+  if (sv == "xml" || sv == "http" || sv == "https") {
+    t = gcs_object_store_config::transport::xml;
+    return true;
+  }
+  if (sv == "grpc") {
+    t = gcs_object_store_config::transport::grpc;
+    return true;
+  }
+  return false;
+}
+
+inline bool enum_to_string(gcs_object_store_config::transport t, std::string& s)
+{
+  switch (t) {
+    case gcs_object_store_config::transport::xml: s = "xml"; return true;
+    case gcs_object_store_config::transport::grpc: s = "grpc"; return true;
+  }
+  return false;
+}
 
 }  // namespace sirius::io

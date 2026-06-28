@@ -73,6 +73,10 @@ pkg_check_modules(NUMA REQUIRED IMPORTED_TARGET numa)
 pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
 pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
 
+# Native GCS gRPC backend (google.storage.v2). Generates the storage stubs into
+# the `gcs_storage_protos` target and brings in gRPC::grpc++.
+include(${CMAKE_CURRENT_LIST_DIR}/cmake/gcs_grpc_proto.cmake)
+
 # cuCascade - GPU Memory Reservation Library (submodule) cucascade links `numa`
 # as a bare library name (-lnuma). In the vcpkg build the static libnuma.a lives
 # in the vcpkg installed lib dir, which isn't on the default linker search path.
@@ -179,6 +183,8 @@ set(EXTENSION_SOURCES
     src/io/prefetching_cache.cpp
     src/io/gcs/gcs_ioctx.cpp
     src/io/gcs/gcs_async_ioctx.cpp
+    src/io/gcs/gcs_grpc_ioctx.cpp
+    src/io/gcs/gcs_grpc_reactor.cpp
     src/io/gcs/gcs_oauth2_authorizer.cpp
     src/io/s3/s3_blocking_ioctx.cpp
     src/io/s3/s3_reactor.cpp
@@ -357,7 +363,9 @@ foreach(_target sirius_extension sirius_loadable_extension)
     spdlog::spdlog
     cuCascade::cucascade
     yaml-cpp::yaml-cpp
-    telemetry_bridge)
+    telemetry_bridge
+    gcs_storage_protos
+    gRPC::grpc++)
 
   add_dependencies(${_target} duckdb_static)
 endforeach()

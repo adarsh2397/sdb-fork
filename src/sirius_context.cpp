@@ -25,6 +25,7 @@
 #include "exec/thread_pool.hpp"
 #include "io/prefetching_cache.hpp"
 #include "io/gcs/gcs_async_ioctx.hpp"
+#include "io/gcs/gcs_grpc_ioctx.hpp"
 #include "io/gcs/gcs_oauth2_authorizer.hpp"
 #include "io/s3/s3_blocking_ioctx.hpp"
 #include "io/s3/s3_ioctx.hpp"
@@ -764,22 +765,41 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     }
 
     if (gcs_provider) {
-      // Use the async GCS backend: the s3_reactor libcurl-multi loop drives all
-      // concurrent range GETs on its own worker thread (no external thread pool
-      // needed). Column chunks within a row group are pipelined: each is GET'd
-      // into a borrowed pinned staging block, then H2D-copied by a CUDA stream
-      // callback — all overlapped, no per-chunk cudaStreamSynchronize.
-      gcs_ioctx_ = std::make_shared<sirius::io::gcs::gcs_async_ioctx>(
-        std::move(gcs_provider),
-        /*request_timeout_s=*/scan_cfg.s3_config
-          ? scan_cfg.s3_config->request_timeout_s
-          : sirius::io::s3::s3_ioctx_config{}.request_timeout_s,
-        config_.gcs_config.ca_bundle_path,
-        config_.gcs_config.tls_verify,
-        /*max_connections=*/scan_cfg.s3_config
-          ? scan_cfg.s3_config->max_connections
-          : sirius::io::s3::s3_ioctx_config{}.max_connections,
-        host_fsmr);
+      auto const req_timeout_s = scan_cfg.s3_config
+                                   ? scan_cfg.s3_config->request_timeout_s
+                                   : sirius::io::s3::s3_ioctx_config{}.request_timeout_s;
+      auto const max_conns     = scan_cfg.s3_config
+                                   ? scan_cfg.s3_config->max_connections
+                                   : sirius::io::s3::s3_ioctx_config{}.max_connections;
+      if (config_.gcs_config.gcs_transport ==
+          sirius::io::gcs_object_store_config::transport::grpc) {
+        // Native gRPC backend (google.storage.v2 ReadObject). Enables DirectPath
+        // on a co-located GCE VM and is the intended path for Rapid (zonal)
+        // buckets. Reuses the same OAuth2 authorizer as call credentials (HMAC
+        // is not applicable to gRPC).
+        sirius::io::gcs::gcs_grpc_reactor::config grpc_cfg{};
+        grpc_cfg.creds                = std::move(gcs_provider);
+        grpc_cfg.endpoint             = config_.gcs_config.grpc_endpoint;
+        grpc_cfg.request_timeout_s    = req_timeout_s;
+        grpc_cfg.max_streams          = max_conns;
+        grpc_cfg.host_memory_resource = host_fsmr;
+        gcs_ioctx_ = std::make_shared<sirius::io::gcs::gcs_grpc_ioctx>(std::move(grpc_cfg));
+        SIRIUS_LOG_INFO("SiriusContext: GCS backend transport=grpc (endpoint={})",
+                        config_.gcs_config.grpc_endpoint);
+      } else {
+        // XML/HTTP async backend: the s3_reactor libcurl-multi loop drives all
+        // concurrent range GETs on its own worker thread. Column chunks within a
+        // row group are pipelined: each is GET'd into a borrowed pinned staging
+        // block, then H2D-copied by a CUDA stream callback — all overlapped, no
+        // per-chunk cudaStreamSynchronize.
+        gcs_ioctx_ = std::make_shared<sirius::io::gcs::gcs_async_ioctx>(
+          std::move(gcs_provider),
+          req_timeout_s,
+          config_.gcs_config.ca_bundle_path,
+          config_.gcs_config.tls_verify,
+          max_conns,
+          host_fsmr);
+      }
     }
   }
 
@@ -810,6 +830,38 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
                                    scan_cfg.prefetch_inflight_budget_chunks);
     }
   }
+
+  // Phase C2: footer/metadata-only cache. When the full chunk-prefetch cache is
+  // off but metadata caching is requested, build a MINIMAL pinned-host pool so
+  // the prefetching_cache object can exist (it structurally requires a
+  // buffer_pool&) and persist parsed parquet footers across queries —
+  // cache-forever, never revalidated. Only the network backends benefit:
+  // re-fetching a footer over GCS/S3 is a network round-trip, whereas the local
+  // urings re-read footers cheaply, so they are intentionally skipped. Chunk
+  // prewarm is forced off (see scan_manager construction below) so the tiny pool
+  // is never churned by per-row-group chunk inserts.
+  bool const metadata_only_cache = !scan_cfg.enable_prefetch_cache &&
+                                   scan_cfg.enable_metadata_cache && host_fsmr != nullptr &&
+                                   (s3_ioctx_ || gcs_ioctx_);
+  if (metadata_only_cache) {
+    auto const slab_bytes = host_fsmr->get_block_size() *
+                            static_cast<std::size_t>(sirius::io::buffer_pool::CHUNKS_PER_SLAB);
+    auto const max_slabs = std::max<uint32_t>(
+      1,
+      static_cast<uint32_t>((scan_cfg.metadata_cache_pool_bytes + slab_bytes - 1) / slab_bytes));
+    prefetch_buffer_pool_ = std::make_unique<sirius::io::buffer_pool>(*host_fsmr, max_slabs);
+    if (s3_ioctx_) {
+      s3_ioctx_->initialize_cache(*prefetch_buffer_pool_, scan_cfg.prefetch_inflight_budget_chunks);
+    }
+    if (gcs_ioctx_) {
+      gcs_ioctx_->initialize_cache(*prefetch_buffer_pool_,
+                                   scan_cfg.prefetch_inflight_budget_chunks);
+    }
+    SIRIUS_LOG_INFO(
+      "SiriusContext: metadata-only footer cache enabled for network backend(s) "
+      "({} slab(s), chunk prewarm forced off)",
+      max_slabs);
+  }
   // Borrowed routing list for the scan_manager: the default local backend
   // (lowest-GPU uring, matching datasource_registry's kFileScheme target) plus
   // the s3_ioctx when configured. The scan_manager dispatches over these but
@@ -827,8 +879,13 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   }
   if (s3_ioctx_) { borrowed_io_ctxs.push_back(s3_ioctx_); }
   if (gcs_ioctx_) { borrowed_io_ctxs.push_back(gcs_ioctx_); }
+  // In metadata-only cache mode, disable chunk prewarm so the minimal pool is
+  // used purely for footer metadata (the split provider gates prewarm on this
+  // flag via sirius_scan_manager::chunk_prewarm_enabled()).
+  auto scan_manager_config = config_.get_scan_manager_config();
+  if (metadata_only_cache) { scan_manager_config.enable_chunk_prewarm = false; }
   scan_manager_ = std::make_unique<sirius::scan_manager::sirius_scan_manager>(
-    config_.get_scan_manager_config(), std::move(borrowed_io_ctxs));
+    std::move(scan_manager_config), std::move(borrowed_io_ctxs));
 
   // Wire the pipeline task queue into downgrade executors now that task_scheduler_
   // has been constructed.

@@ -31,6 +31,10 @@ llvm-tools = "21.*"
 pkg-config = "*"
 mold = "*"
 libprotobuf = "*"
+# gRPC C++ runtime + protoc grpc_cpp_plugin for the native GCS gRPC backend
+# (google.storage.v2 ReadObject). conda-forge ships the toolchain (protoc +
+# grpc_cpp_plugin) and runtime under grpc-cpp / libgrpc.
+grpc-cpp = "*"
 rust = "*"
 
 [feature.dev-libs.dependencies]

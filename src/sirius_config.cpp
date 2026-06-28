@@ -97,6 +97,8 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
              opt.prefetch_inflight_budget_chunks,
              yaml::greater_than<std::size_t>{0});
   r.optional("enable_chunk_prewarm", opt.enable_chunk_prewarm);
+  r.optional("enable_metadata_cache", opt.enable_metadata_cache);
+  r.optional("metadata_cache_pool_bytes", yaml::bytes(opt.metadata_cache_pool_bytes));
   r.reject_unknown();
 }
 
@@ -119,6 +121,8 @@ static void from_yaml(const YAML::Node& node, sirius::io::object_store_config& o
 static void from_yaml(const YAML::Node& node, sirius::io::gcs_object_store_config& opt)
 {
   yaml::reader r(node, "gcs_config");
+  r.optional("transport", opt.gcs_transport);
+  r.optional("grpc_endpoint", opt.grpc_endpoint);
   r.optional("hmac_access_key", opt.hmac_access_key);
   r.optional("hmac_secret_key", opt.hmac_secret_key);
   r.optional("use_metadata_server", opt.use_metadata_server);
