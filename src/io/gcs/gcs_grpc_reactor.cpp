@@ -18,6 +18,8 @@
 
 #include "io/uri_parser.hpp"
 
+#include <absl/strings/cord.h>
+#include <absl/strings/string_view.h>
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/security/credentials.h>
 
@@ -204,10 +206,16 @@ std::size_t gcs_grpc_reactor::host_read(native_handle_type handle,
   v2::ReadObjectResponse resp;
   while (reader->Read(&resp)) {
     if (resp.has_checksummed_data()) {
-      auto const& content = resp.checksummed_data().content();
-      auto const n        = std::min<std::size_t>(content.size(), size - written);
-      if (n > 0) {
-        std::memcpy(dst + written, content.data(), n);
+      // ChecksummedData.content is `bytes content = 1 [ctype = CORD]` in the GCS
+      // v2 proto, so the generated accessor returns an absl::Cord (the plain
+      // std::string content() accessor is private under the CORD ctype). A Cord
+      // is not a single contiguous buffer, so copy it chunk-by-chunk into dst,
+      // bounded by the remaining request size.
+      absl::Cord const& content = resp.checksummed_data().content();
+      for (absl::string_view chunk : content.Chunks()) {
+        if (written >= size) break;
+        auto const n = std::min<std::size_t>(chunk.size(), size - written);
+        std::memcpy(dst + written, chunk.data(), n);
         written += n;
       }
       if (written >= size) break;

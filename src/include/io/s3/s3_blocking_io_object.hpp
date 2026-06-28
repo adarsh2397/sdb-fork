@@ -41,7 +41,7 @@ namespace sirius::io::s3 {
  * @c raw_file_cache_id(); the two are kept distinct for forward compatibility
  * with versioned-key backends where a cache id may carry a version qualifier.
  */
-class s3_blocking_io_object final : public sirius_io_object {
+class s3_blocking_io_object : public sirius_io_object {
  public:
   s3_blocking_io_object(std::string bucket, std::string key, std::size_t size, std::string path)
     : _bucket(std::move(bucket)),

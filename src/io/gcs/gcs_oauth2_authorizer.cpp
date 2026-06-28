@@ -191,7 +191,7 @@ void gcs_metadata_server_authorizer::refresh_token_locked()
                   std::chrono::seconds{expires_in - kRefreshLeadSeconds};
 }
 
-s3_authorized_request gcs_metadata_server_authorizer::authorize(
+sirius::io::s3::s3_authorized_request gcs_metadata_server_authorizer::authorize(
   sirius::io::s3::s3_object_ref const& obj,
   sirius::io::s3::s3_request_method /*method*/,
   std::chrono::seconds /*timeout*/)
