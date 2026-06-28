@@ -24,7 +24,7 @@
 #include "duckdb/planner/planner.hpp"
 #include "exec/thread_pool.hpp"
 #include "io/prefetching_cache.hpp"
-#include "io/gcs/gcs_ioctx.hpp"
+#include "io/gcs/gcs_async_ioctx.hpp"
 #include "io/gcs/gcs_oauth2_authorizer.hpp"
 #include "io/s3/s3_blocking_ioctx.hpp"
 #include "io/s3/s3_ioctx.hpp"
@@ -764,20 +764,22 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     }
 
     if (gcs_provider) {
-      // Mirror the S3 blocking path: create a thread pool for async range GETs
-      // so column chunks within a row group are fetched in parallel rather than
-      // serially. Uses the same thread pool config as S3 for consistency.
-      gcs_thread_pool_ = std::make_unique<sirius::exec::static_thread_pool>(
-        scan_cfg.s3_thread_pool.num_threads,
-        "gcs-io",
-        scan_cfg.s3_thread_pool.cpu_affinity_list);
-      sirius::io::s3::s3_ioctx_config gcs_cfg{};
-      gcs_cfg.creds                = std::move(gcs_provider);
-      gcs_cfg.ca_bundle_path       = config_.gcs_config.ca_bundle_path;
-      gcs_cfg.tls_verify           = config_.gcs_config.tls_verify;
-      gcs_cfg.host_memory_resource = host_fsmr;
-      gcs_cfg.async_thread_pool    = gcs_thread_pool_.get();
-      gcs_ioctx_ = std::make_shared<sirius::io::gcs::gcs_ioctx>(std::move(gcs_cfg));
+      // Use the async GCS backend: the s3_reactor libcurl-multi loop drives all
+      // concurrent range GETs on its own worker thread (no external thread pool
+      // needed). Column chunks within a row group are pipelined: each is GET'd
+      // into a borrowed pinned staging block, then H2D-copied by a CUDA stream
+      // callback — all overlapped, no per-chunk cudaStreamSynchronize.
+      gcs_ioctx_ = std::make_shared<sirius::io::gcs::gcs_async_ioctx>(
+        std::move(gcs_provider),
+        /*request_timeout_s=*/scan_cfg.s3_config
+          ? scan_cfg.s3_config->request_timeout_s
+          : sirius::io::s3::s3_ioctx_config{}.request_timeout_s,
+        config_.gcs_config.ca_bundle_path,
+        config_.gcs_config.tls_verify,
+        /*max_connections=*/scan_cfg.s3_config
+          ? scan_cfg.s3_config->max_connections
+          : sirius::io::s3::s3_ioctx_config{}.max_connections,
+        host_fsmr);
     }
   }
 
@@ -932,11 +934,9 @@ void SiriusContext::terminate()
   // s3_ioctx is gone, stop/reset the pool, then release the buffer_pool LAST
   // (both the s3 cache and the per-NUMA uring caches reference it).
   s3_ioctx_.reset();
-  gcs_ioctx_.reset();
+  gcs_ioctx_.reset();  // async reactor shuts down its own worker thread on destroy
   if (s3_thread_pool_) { s3_thread_pool_->stop(); }
-  if (gcs_thread_pool_) { gcs_thread_pool_->stop(); }
   s3_thread_pool_.reset();
-  gcs_thread_pool_.reset();
   prefetch_buffer_pool_.reset();
 
   // Drop any remaining repositories while the memory manager is still alive.

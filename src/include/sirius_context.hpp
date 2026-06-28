@@ -366,19 +366,17 @@ class SiriusContext : public ClientContextState {
   // worker thread, so this stays null when s3_use_async_backend is set). Must
   // outlive s3_ioctx_ (declared before it).
   std::unique_ptr<sirius::exec::static_thread_pool> s3_thread_pool_;
-  // Thread pool for async GCS range GETs (mirrors s3_thread_pool_). Must
-  // outlive gcs_ioctx_ (declared before it).
-  std::unique_ptr<sirius::exec::static_thread_pool> gcs_thread_pool_;
   // The S3 backend (S6 increment 1: single shared instance), owned here and
   // borrowed by the scan_manager. nullptr when no object_store_config is wired.
   std::shared_ptr<sirius::io::sirius_ioctx> s3_ioctx_;
-  // The GCS backend (HMAC / S3-compatible), owned here and borrowed by the
-  // scan_manager. nullptr when no gcs_config is wired.
+  // The GCS backend (async libcurl-multi reactor), owned here and borrowed by
+  // the scan_manager. nullptr when no gcs_config is wired. The reactor owns its
+  // own worker thread — no external thread pool required.
   std::shared_ptr<sirius::io::sirius_ioctx> gcs_ioctx_;
   // Teardown order in terminate(): scan_manager_ (drops borrowed aliases) ->
   // datasource_registry_ -> gpu_ioctxs_ (view, drops references) -> numa_ioctxs_
   // (destroys reactor pools + uring caches under a live CUDA context) ->
-  // s3_ioctx_ / gcs_ioctx_ (destroy caches) -> s3_thread_pool_ / gcs_thread_pool_ ->
+  // s3_ioctx_ / gcs_ioctx_ (destroy caches) -> s3_thread_pool_ ->
   // prefetch_buffer_pool_ (last, after every cache that references it),
   // all BEFORE memory_manager_ shutdown.
   std::unordered_map<int, std::shared_ptr<sirius::io::sirius_ioctx>> numa_ioctxs_;
