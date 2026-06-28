@@ -73,6 +73,7 @@ set(GCS_GRPC_PROTO_FILES
     google/api/routing.proto
     google/rpc/status.proto
     google/type/date.proto
+    google/type/expr.proto
     google/iam/v1/iam_policy.proto
     google/iam/v1/policy.proto
     google/iam/v1/options.proto)
@@ -106,7 +107,13 @@ foreach(_proto ${GCS_GRPC_PROTO_FILES})
 endforeach()
 
 add_library(gcs_storage_protos STATIC ${_GCS_GEN_SRCS})
-target_include_directories(gcs_storage_protos PUBLIC ${_GCS_PROTO_OUT})
+# Wrap the generated-headers dir in $<BUILD_INTERFACE:> so the path applies only
+# in the build tree. Required because gcs_storage_protos is in DuckDB's export
+# set (see CMakeLists.txt install(TARGETS ... gcs_storage_protos EXPORT ...)):
+# CMake forbids exporting a raw build-directory path on a target's include
+# interface. These protos are internal (only sirius_extension consumes the
+# headers, at build time), so there is no $<INSTALL_INTERFACE:> counterpart.
+target_include_directories(gcs_storage_protos PUBLIC $<BUILD_INTERFACE:${_GCS_PROTO_OUT}>)
 target_link_libraries(gcs_storage_protos PUBLIC gRPC::grpc++ protobuf::libprotobuf)
 # Generated protobuf code triggers these under -Werror; quiet them locally.
 target_compile_options(gcs_storage_protos PRIVATE -Wno-unused-parameter)

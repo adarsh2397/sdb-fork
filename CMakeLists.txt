@@ -422,9 +422,19 @@ endif()
 # cucascade_static / telemetry_bridge). cucascade upstream PR #126 split
 # topology_discovery into its own static target — list it here so the export set
 # covers the dependency chain.
+#
+# gcs_storage_protos is a STATIC lib linked into sirius_extension via the plain
+# (no-keyword) target_link_libraries signature above, which puts it on the
+# extension's public link interface. Because every link call for sirius_extension
+# uses the plain signature, we cannot switch this one dep to PRIVATE (CMake
+# forbids mixing plain + keyword signatures on one target). So instead we add it
+# to the same export set — matching how cucascade_static / telemetry_bridge are
+# handled — to satisfy the "must be in an export set" requirement. Its PUBLIC
+# deps (gRPC::grpc++, protobuf::libprotobuf) are IMPORTED targets and do not need
+# installing.
 install(
   TARGETS sirius_extension cucascade_static cucascade_topology_discovery_static
-          telemetry_bridge
+          telemetry_bridge gcs_storage_protos
   EXPORT "${DUCKDB_EXPORT_SET}"
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
