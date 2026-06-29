@@ -258,11 +258,12 @@ void gcs_grpc_reactor::enqueue_bulk(std::span<device_read_req_type> batch)
           throw std::runtime_error("gcs_grpc_reactor: device reads require a host memory resource");
         }
         auto staging = _impl->host_mr->allocate_multiple_blocks(r.data_size, nullptr);
-        // multiple_blocks_allocation exposes raw block pointers via get_blocks()
-        // (std::byte*), not the .at(i)->span API of fixed_multiple_blocks_allocation.
-        // r.data_size <= block_size here (single staging block), so block 0 is the
-        // contiguous destination.
-        auto* host = reinterpret_cast<std::uint8_t*>(staging.get_blocks()[0]);
+        // FSMR::allocate_multiple_blocks returns a fixed_multiple_blocks_allocation,
+        // a move-only handle whose operator-> exposes at(i) (each a span with
+        // .data()) — the same access pattern as s3_reactor's staging. r.data_size
+        // <= block_size here (single staging block), so block 0 is the contiguous
+        // destination.
+        auto* host = reinterpret_cast<std::uint8_t*>(staging->at(0).data());
         host_read(r.handle, r.file_off, r.io_size, host);
         if (r.device_id >= 0) { cudaSetDevice(r.device_id); }
         cudaMemcpyAsync(r.dst, host + r.data_off, r.data_size, cudaMemcpyHostToDevice, r.stream);
