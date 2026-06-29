@@ -27,11 +27,14 @@
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstring>
-#include <future>
+#include <deque>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 
 namespace sirius::io::gcs {
@@ -119,25 +122,171 @@ std::exception_ptr to_exception(grpc::Status const& s, std::string_view what)
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// impl — hides grpc/proto types from the header
+// read_op — per async ReadObject stream state, driven by the CompletionQueue.
+// ---------------------------------------------------------------------------
+// One outstanding CQ op at a time, so the op pointer itself is the tag and the
+// `state` field tells the worker which step just completed. Lifetime: new'd at
+// submit, delete'd when the FINISH completion is handled.
+using host_read_req_t = gcs_grpc_reactor::host_read_req_type;
+
+struct read_op {
+  grpc::ClientContext ctx;
+  v2::ReadObjectRequest grpc_req;
+  v2::ReadObjectResponse resp;
+  std::unique_ptr<grpc::ClientAsyncReader<v2::ReadObjectResponse>> reader;
+  host_read_req_t hr;          // keeps handle alive + carries ctx for chunk_done/failed
+  std::uint8_t* dst{nullptr};
+  std::size_t size{0};
+  std::size_t written{0};
+  enum class phase { start, reading, finish } state{phase::start};
+  grpc::Status status;
+};
+
+// ---------------------------------------------------------------------------
+// impl — async CompletionQueue reactor. One channel (HTTP/2 multiplexing), one
+// CQ, one worker thread driving up to `max_streams` concurrent ReadObject
+// streams. Mirrors s3_reactor's curl-multi loop: a bounded in-flight window
+// (max_streams ~ s3_reactor's max_connections), refilled as ops complete.
 // ---------------------------------------------------------------------------
 struct gcs_grpc_reactor::impl {
   std::shared_ptr<grpc::Channel> channel;
   std::unique_ptr<v2::Storage::Stub> stub;
   cucascade::memory::fixed_size_host_memory_resource* host_mr{nullptr};
   long timeout_s{60};
+  std::size_t max_streams{16};
+  std::atomic<std::uint64_t>* bytes_counter{nullptr};
 
-  // Minimal worker pool for async host reads. TODO(grpc-backend): replace with
-  // a completion-queue-driven async reactor for true pipelining (this synchronous
-  // pool mirrors s3_blocking_ioctx's fan-out, not s3_reactor's curl-multi loop).
-  // For now std::async per request is sufficient to validate the path.
+  grpc::CompletionQueue cq;
+  std::thread worker;
+
+  std::mutex mtx;
+  std::deque<read_op*> pending;  // ops awaiting an in-flight slot
+  std::size_t inflight{0};
+  bool stopping{false};
+
+  void fill_request(read_op* op, host_read_req_t const& hr)
+  {
+    op->hr      = hr;
+    op->dst     = hr.dst;
+    op->size    = hr.size;
+    op->written = 0;
+    op->grpc_req.set_bucket(bucket_resource(hr.handle->bucket));
+    op->grpc_req.set_object(hr.handle->key);
+    if (hr.handle->generation != 0) { op->grpc_req.set_generation(hr.handle->generation); }
+    op->grpc_req.set_read_offset(static_cast<int64_t>(hr.offset));
+    op->grpc_req.set_read_limit(static_cast<int64_t>(hr.size));
+    op->ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(timeout_s));
+    op->ctx.AddMetadata("x-goog-request-params", routing_params(hr.handle->bucket));
+  }
+
+  // Initiate the async call. Safe to call from any thread (gRPC associates the
+  // call with the CQ); all subsequent Read/Finish steps run on the worker.
+  void start_op(read_op* op)
+  {
+    op->state  = read_op::phase::start;
+    op->reader = stub->AsyncReadObject(&op->ctx, op->grpc_req, &cq, op);
+  }
+
+  // Submit a host read: start it immediately if under the in-flight cap, else
+  // queue it. Called from scan/IO threads via host_read_async.
+  void submit(host_read_req_t hr)
+  {
+    auto* op = new read_op();
+    fill_request(op, hr);
+
+    std::unique_lock<std::mutex> lk(mtx);
+    if (stopping) {
+      lk.unlock();
+      if (op->hr.ctx) {
+        op->hr.ctx->chunk_failed(
+          std::make_exception_ptr(std::runtime_error("gcs_grpc: reactor stopping")));
+      }
+      delete op;
+      return;
+    }
+    if (inflight < max_streams) {
+      ++inflight;
+      lk.unlock();
+      start_op(op);
+    } else {
+      pending.push_back(op);
+    }
+  }
+
+  // Deliver the result, free the op, and pull the next pending op into the
+  // freed in-flight slot (mirrors s3_reactor::submit_pending refill).
+  void retire(read_op* op)
+  {
+    if (op->status.ok()) {
+      if (bytes_counter) bytes_counter->fetch_add(op->written, std::memory_order_relaxed);
+      if (op->hr.ctx) op->hr.ctx->chunk_done();
+    } else {
+      if (op->hr.ctx) op->hr.ctx->chunk_failed(to_exception(op->status, "ReadObject"));
+    }
+    delete op;
+
+    std::unique_lock<std::mutex> lk(mtx);
+    --inflight;
+    if (!stopping && !pending.empty()) {
+      auto* next = pending.front();
+      pending.pop_front();
+      ++inflight;
+      lk.unlock();
+      start_op(next);
+    }
+  }
+
+  // Single CQ driver: advances each stream's state machine. Many streams share
+  // this one thread — true async pipelining over the multiplexed channel.
+  void worker_loop()
+  {
+    void* tag = nullptr;
+    bool ok   = false;
+    while (cq.Next(&tag, &ok)) {
+      auto* op = static_cast<read_op*>(tag);
+      switch (op->state) {
+        case read_op::phase::start:
+          if (!ok) {  // call failed to start -> reap status
+            op->state = read_op::phase::finish;
+            op->reader->Finish(&op->status, op);
+            break;
+          }
+          op->state = read_op::phase::reading;
+          op->reader->Read(&op->resp, op);
+          break;
+
+        case read_op::phase::reading:
+          if (ok) {
+            if (op->resp.has_checksummed_data()) {
+              auto const& content = op->resp.checksummed_data().content();
+              auto const n = std::min<std::size_t>(content.size(), op->size - op->written);
+              if (n > 0) {
+                std::memcpy(op->dst + op->written, content.data(), n);
+                op->written += n;
+              }
+            }
+            op->reader->Read(&op->resp, op);  // pull the next message
+          } else {                            // stream end -> finish
+            op->state = read_op::phase::finish;
+            op->reader->Finish(&op->status, op);
+          }
+          break;
+
+        case read_op::phase::finish:
+          retire(op);
+          break;
+      }
+    }
+  }
 };
 
 gcs_grpc_reactor::gcs_grpc_reactor(config cfg) : _cfg(std::move(cfg))
 {
-  _impl           = std::make_unique<impl>();
-  _impl->host_mr  = _cfg.host_memory_resource;
-  _impl->timeout_s = _cfg.request_timeout_s;
+  _impl                = std::make_unique<impl>();
+  _impl->host_mr       = _cfg.host_memory_resource;
+  _impl->timeout_s     = _cfg.request_timeout_s;
+  _impl->max_streams   = std::max<std::size_t>(_cfg.max_streams, 1);
+  _impl->bytes_counter = &_bytes_read_total;
 
   if (!_cfg.creds) {
     throw std::invalid_argument("gcs_grpc_reactor: creds (authorizer) is required");
@@ -159,12 +308,39 @@ gcs_grpc_reactor::gcs_grpc_reactor(config cfg) : _cfg(std::move(cfg))
   }
   _impl->channel = grpc::CreateChannel(target, channel_creds);
   _impl->stub    = v2::Storage::NewStub(_impl->channel);
+
+  // Start the CQ worker last, once channel + stub are live.
+  _impl->worker = std::thread([this]() { _impl->worker_loop(); });
 }
 
 gcs_grpc_reactor::~gcs_grpc_reactor() { shutdown(); }
 
 void gcs_grpc_reactor::interrupt() {}
-void gcs_grpc_reactor::shutdown() { /* channel/stub torn down with _impl */ }
+
+void gcs_grpc_reactor::shutdown()
+{
+  if (!_impl) return;
+  {
+    std::lock_guard<std::mutex> lk(_impl->mtx);
+    if (_impl->stopping) return;
+    _impl->stopping = true;
+  }
+  // Drain: in-flight ops complete (or hit their deadline) and the worker reaps
+  // them; once the CQ is shut down and emptied, cq.Next returns false and the
+  // worker exits.
+  _impl->cq.Shutdown();
+  if (_impl->worker.joinable()) { _impl->worker.join(); }
+
+  // Fail any ops that never got an in-flight slot.
+  for (auto* op : _impl->pending) {
+    if (op->hr.ctx) {
+      op->hr.ctx->chunk_failed(
+        std::make_exception_ptr(std::runtime_error("gcs_grpc: reactor shut down")));
+    }
+    delete op;
+  }
+  _impl->pending.clear();
+}
 
 cudf::io::text::byte_range_info gcs_grpc_reactor::align_to_physical(
   cudf::io::text::byte_range_info logical, std::size_t file_size)
@@ -254,16 +430,10 @@ std::size_t gcs_grpc_reactor::host_read(native_handle_type handle,
 
 void gcs_grpc_reactor::host_read_async(host_read_req_type req)
 {
-  // TODO(grpc-backend): route through a completion-queue reactor for real async.
-  // This synchronous-on-a-detached-future shim is correct but not pipelined.
-  std::thread([this, req = std::move(req)]() mutable {
-    try {
-      host_read(req.handle, req.offset, req.size, req.dst);
-      if (req.ctx) req.ctx->chunk_done();
-    } catch (...) {
-      if (req.ctx) req.ctx->chunk_failed(std::current_exception());
-    }
-  }).detach();
+  // Hand off to the CompletionQueue reactor: the read runs as an async
+  // ReadObject stream multiplexed over the shared channel, bounded by
+  // max_streams, with completion delivered via req.ctx (chunk_done/failed).
+  _impl->submit(std::move(req));
 }
 
 void gcs_grpc_reactor::host_enqueue_bulk(std::span<host_read_req_type> batch)
