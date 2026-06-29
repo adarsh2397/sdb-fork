@@ -72,8 +72,29 @@ std::shared_ptr<sirius_io_object> gcs_grpc_ioctx::create_io_object(std::string p
                                 parsed.scheme + "' (expected 'gs')");
   }
   // parsed.host == bucket, parsed.path == object key.
-  auto state = reactor().stat_object(parsed.host, parsed.path);
-  auto sp    = std::make_shared<gcs_grpc_object_state>(std::move(state));
+  //
+  // Reuse a cached stat (size + generation) to skip the per-file GetObject on
+  // repeat scans of the same path. The stat is keyed by the gs:// path (== the
+  // io_object's cache id) in the prefetch cache, so it shares the cache's
+  // lifetime/enable flag with the footer metadata. First run populates it;
+  // later runs skip the round-trip. Assumes the object is immutable (standard
+  // for parquet datasets).
+  gcs_grpc_object_state state;
+  if (auto* c = cache()) {
+    if (auto cached = c->get_object_size(path)) {
+      state.bucket      = parsed.host;
+      state.key         = parsed.path;
+      state.object_size = cached->size;
+      state.generation  = cached->generation;
+    } else {
+      state = reactor().stat_object(parsed.host, parsed.path);
+      c->put_object_size(path, {state.object_size, state.generation});
+    }
+  } else {
+    state = reactor().stat_object(parsed.host, parsed.path);
+  }
+
+  auto sp = std::make_shared<gcs_grpc_object_state>(std::move(state));
   return std::make_shared<gcs_grpc_io_object>(std::move(path), std::move(sp));
 }
 

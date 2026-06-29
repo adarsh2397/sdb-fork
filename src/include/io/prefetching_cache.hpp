@@ -28,14 +28,17 @@
 
 #include <array>
 #include <atomic>
+#include <cstdint>
 #include <future>
 #include <list>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <semaphore>
 #include <shared_mutex>
 #include <span>
 #include <stop_token>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -541,6 +544,23 @@ class prefetching_cache {
   [[nodiscard]] std::shared_ptr<sirius_io_object_metadata> get_metadata(
     const sirius_io_object& obj) const;
 
+  /// Cached object stat (size + generation) — lets a backend's create_io_object
+  /// skip the per-file HEAD/GetObject round-trip on repeat scans of the same
+  /// path. Keyed by the object's cache id (e.g. the gs:// URI). Assumes the
+  /// object is immutable for the cache's lifetime (standard for parquet
+  /// datasets); an overwritten file would serve a stale size.
+  struct object_size_info {
+    std::size_t size{0};
+    std::int64_t generation{0};
+  };
+
+  /// Returns the cached stat for @p cache_id, or nullopt if not yet known.
+  [[nodiscard]] std::optional<object_size_info> get_object_size(
+    const std::string& cache_id) const;
+
+  /// Record the stat for @p cache_id (first-run population by create_io_object).
+  void put_object_size(const std::string& cache_id, object_size_info info);
+
   /// Increment _cache_age by 1.  The evictor uses
   /// (n_total_read_request - _cache_age) to score entries into buckets.
   void refresh_cache();
@@ -696,6 +716,12 @@ class prefetching_cache {
 
   mutable std::shared_mutex _map_mtx;
   std::unordered_map<std::string, std::unique_ptr<file_entry>> _file_cache;
+
+  /// Object-stat cache (size + generation) keyed by cache id, separate from
+  /// _file_cache so it does not interact with byte-range eviction. Entries are
+  /// tiny and persist for the cache's lifetime. Guarded by its own lock.
+  mutable std::shared_mutex _size_mtx;
+  std::unordered_map<std::string, object_size_info> _object_sizes;
 
   /// Evictor inputs.  Candidate pushes are silent; request pushes bump the
   /// semaphore.  Evictor polls with a timeout to still drain candidates

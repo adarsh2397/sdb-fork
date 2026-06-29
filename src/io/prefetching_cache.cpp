@@ -642,6 +642,21 @@ std::shared_ptr<sirius_io_object_metadata> prefetching_cache::get_metadata(
   return file.metadata;
 }
 
+std::optional<prefetching_cache::object_size_info> prefetching_cache::get_object_size(
+  const std::string& cache_id) const
+{
+  std::shared_lock lk(_size_mtx);
+  auto it = _object_sizes.find(cache_id);
+  if (it == _object_sizes.end()) { return std::nullopt; }
+  return it->second;
+}
+
+void prefetching_cache::put_object_size(const std::string& cache_id, object_size_info info)
+{
+  std::unique_lock lk(_size_mtx);
+  _object_sizes[cache_id] = info;
+}
+
 void prefetching_cache::refresh_cache()
 {
   _cache_age.fetch_add(1, std::memory_order_relaxed);

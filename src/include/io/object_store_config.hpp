@@ -147,6 +147,15 @@ struct gcs_object_store_config {
   /// latency-bound waves. Raise further if reads stay network-bound.
   std::size_t grpc_max_streams = 128;
 
+  /// When true, build the gRPC channel for DirectPath: c2p resolver
+  /// ("google-c2p:///<grpc_endpoint>") + GoogleDefaultCredentials (ALTS + the
+  /// VM's compute service-account auth), bypassing the GFE on a co-located GCE
+  /// VM — the fast path for Rapid (zonal) buckets. In this mode auth comes from
+  /// GoogleDefaultCredentials, not the OAuth2 authorizer. Off-GCE this must stay
+  /// false; gRPC auto-falls back to CFE/TLS if DirectPath can't be negotiated.
+  /// Ignored unless @c gcs_transport == grpc.
+  bool grpc_directpath = false;
+
   /// GCS HMAC key ID (typically starts with "GOOG1E"). Ignored when
   /// @c use_metadata_server is true.
   std::string hmac_access_key;

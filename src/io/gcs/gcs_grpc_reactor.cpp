@@ -292,20 +292,33 @@ gcs_grpc_reactor::gcs_grpc_reactor(config cfg) : _cfg(std::move(cfg))
     throw std::invalid_argument("gcs_grpc_reactor: creds (authorizer) is required");
   }
 
-  // Composite channel credentials: TLS transport + per-call bearer token.
-  // TODO(grpc-backend): for DirectPath (co-located VM + Rapid bucket), target
-  // "google-c2p:///storage.googleapis.com" and use GoogleDefaultCredentials so
-  // gRPC negotiates ALTS/DirectPath; the SSL path below is the portable
-  // fallback that works off-GCE.
-  auto call_creds = grpc::MetadataCredentialsFromPlugin(
-    std::make_unique<authorizer_call_credentials>(_cfg.creds));
-  auto channel_creds =
-    grpc::CompositeChannelCredentials(grpc::SslCredentials(grpc::SslCredentialsOptions{}), call_creds);
+  std::string target;
+  std::shared_ptr<grpc::ChannelCredentials> channel_creds;
 
-  std::string target = _cfg.endpoint;
-  if (target.find("://") == std::string::npos && target.find(':') == std::string::npos) {
-    target += ":443";  // default gRPC TLS port
+  if (_cfg.directpath) {
+    // DirectPath: the c2p resolver triggers DirectPath negotiation, and
+    // GoogleDefaultCredentials carries the ALTS transport creds + compute-SA
+    // auth (so the bearer-plugin is not used in this mode). On a co-located GCE
+    // VM this bypasses the GFE; gRPC auto-falls back to CFE/TLS otherwise.
+    // endpoint is a bare host here (strip any scheme/port defensively).
+    auto host = _cfg.endpoint;
+    if (auto p = host.find("://"); p != std::string::npos) host = host.substr(p + 3);
+    if (auto c = host.find(':'); c != std::string::npos) host = host.substr(0, c);
+    target        = "google-c2p:///" + host;
+    channel_creds = grpc::GoogleDefaultCredentials();
+  } else {
+    // Portable path: TLS transport + per-call bearer token from the authorizer.
+    auto call_creds = grpc::MetadataCredentialsFromPlugin(
+      std::make_unique<authorizer_call_credentials>(_cfg.creds));
+    channel_creds = grpc::CompositeChannelCredentials(
+      grpc::SslCredentials(grpc::SslCredentialsOptions{}), call_creds);
+
+    target = _cfg.endpoint;
+    if (target.find("://") == std::string::npos && target.find(':') == std::string::npos) {
+      target += ":443";  // default gRPC TLS port
+    }
   }
+
   _impl->channel = grpc::CreateChannel(target, channel_creds);
   _impl->stub    = v2::Storage::NewStub(_impl->channel);
 

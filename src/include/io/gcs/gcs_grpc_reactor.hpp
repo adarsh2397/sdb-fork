@@ -102,6 +102,14 @@ class gcs_grpc_reactor {
   struct config {
     std::shared_ptr<sirius::io::s3::s3_request_authorizer> creds;
     std::string endpoint{"storage.googleapis.com"};  ///< gRPC target (DirectPath: google-c2p:///)
+    /// When true, build the channel for DirectPath: target the c2p resolver
+    /// ("google-c2p:///<host>") with GoogleDefaultCredentials (ALTS handshake +
+    /// compute-SA auth), bypassing the GFE on a co-located GCE VM. Auth in this
+    /// mode is handled by GoogleDefaultCredentials, so @c creds is not used for
+    /// the bearer header (it is still required for the non-DirectPath path and
+    /// for stat/HEAD construction). Off-GCE this must be false. gRPC auto-falls
+    /// back to CFE/TLS if DirectPath cannot be negotiated.
+    bool directpath{false};
     long request_timeout_s{60};
     std::size_t max_streams{16};  ///< concurrent ReadObject streams in flight
     cucascade::memory::fixed_size_host_memory_resource* host_memory_resource{nullptr};
