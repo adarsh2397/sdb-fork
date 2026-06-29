@@ -63,11 +63,19 @@ file(MAKE_DIRECTORY ${_GCS_PROTO_OUT})
 # with `[ctype = CORD]`. Protobuf builds without Cord support (the common
 # conda-forge / vcpkg case) generate the std::string content() accessor as
 # PRIVATE and emit no usable public Cord accessor — making the field unreadable
-# ("content() is private"). Strip the annotation in-place before protoc runs so
-# the generated accessor is a plain public `const std::string& content()`. The
-# regex tolerates whitespace variants (`[ctype = CORD]`, `[ctype=CORD]`).
+# ("content() is private"). Strip just the `ctype = CORD` directive in-place
+# before protoc runs so the generated accessor is a plain public
+# `const std::string& content()`. The directive appears in any list position and
+# is usually combined with other field options, e.g.
+#   bytes content = 1 [ctype = CORD, (google.api.field_behavior) = OPTIONAL];
+# so we remove only the CORD option (and its adjoining comma), preserving the
+# rest. The four passes cover sole / first / middle / last positions, for every
+# CORD field in the file.
 file(READ ${_GCS_PROTO_ROOT}/google/storage/v2/storage.proto _gcs_storage_proto_src)
-string(REGEX REPLACE "\\[ctype *= *CORD\\]" "" _gcs_storage_proto_src "${_gcs_storage_proto_src}")
+string(REGEX REPLACE "\\[ *ctype *= *CORD *\\]" ""  _gcs_storage_proto_src "${_gcs_storage_proto_src}")  # sole option
+string(REGEX REPLACE ", *ctype *= *CORD *,"      "," _gcs_storage_proto_src "${_gcs_storage_proto_src}")  # middle of list
+string(REGEX REPLACE "\\[ *ctype *= *CORD *, *"  "[" _gcs_storage_proto_src "${_gcs_storage_proto_src}")  # first in list
+string(REGEX REPLACE ", *ctype *= *CORD *\\]"    "]" _gcs_storage_proto_src "${_gcs_storage_proto_src}")  # last in list
 file(WRITE ${_GCS_PROTO_ROOT}/google/storage/v2/storage.proto "${_gcs_storage_proto_src}")
 
 # Curated subset of protos to generate. storage.proto is the only one needing
