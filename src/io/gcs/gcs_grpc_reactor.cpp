@@ -18,8 +18,6 @@
 
 #include "io/uri_parser.hpp"
 
-#include <absl/strings/cord.h>
-#include <absl/strings/string_view.h>
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/security/credentials.h>
 
@@ -207,15 +205,13 @@ std::size_t gcs_grpc_reactor::host_read(native_handle_type handle,
   while (reader->Read(&resp)) {
     if (resp.has_checksummed_data()) {
       // ChecksummedData.content is `bytes content = 1 [ctype = CORD]` in the GCS
-      // v2 proto, so the generated accessor returns an absl::Cord (the plain
-      // std::string content() accessor is private under the CORD ctype). A Cord
-      // is not a single contiguous buffer, so copy it chunk-by-chunk into dst,
-      // bounded by the remaining request size.
-      absl::Cord const& content = resp.checksummed_data().content();
-      for (absl::string_view chunk : content.Chunks()) {
-        if (written >= size) break;
-        auto const n = std::min<std::size_t>(chunk.size(), size - written);
-        std::memcpy(dst + written, chunk.data(), n);
+      // v2 proto. The cmake proto step (cmake/gcs_grpc_proto.cmake) strips the
+      // `[ctype = CORD]` annotation before protoc runs, so the generated accessor
+      // is a plain public `const std::string& content()` — no absl::Cord needed.
+      auto const& content = resp.checksummed_data().content();
+      auto const n        = std::min<std::size_t>(content.size(), size - written);
+      if (n > 0) {
+        std::memcpy(dst + written, content.data(), n);
         written += n;
       }
       if (written >= size) break;
@@ -262,7 +258,11 @@ void gcs_grpc_reactor::enqueue_bulk(std::span<device_read_req_type> batch)
           throw std::runtime_error("gcs_grpc_reactor: device reads require a host memory resource");
         }
         auto staging = _impl->host_mr->allocate_multiple_blocks(r.data_size, nullptr);
-        auto* host   = reinterpret_cast<std::uint8_t*>(staging.at(0).data());
+        // multiple_blocks_allocation exposes raw block pointers via get_blocks()
+        // (std::byte*), not the .at(i)->span API of fixed_multiple_blocks_allocation.
+        // r.data_size <= block_size here (single staging block), so block 0 is the
+        // contiguous destination.
+        auto* host = reinterpret_cast<std::uint8_t*>(staging.get_blocks()[0]);
         host_read(r.handle, r.file_off, r.io_size, host);
         if (r.device_id >= 0) { cudaSetDevice(r.device_id); }
         cudaMemcpyAsync(r.dst, host + r.data_off, r.data_size, cudaMemcpyHostToDevice, r.stream);

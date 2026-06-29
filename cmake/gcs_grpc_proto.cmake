@@ -59,6 +59,17 @@ set(_GCS_PROTO_ROOT ${googleapis_SOURCE_DIR})
 set(_GCS_PROTO_OUT ${CMAKE_CURRENT_BINARY_DIR}/gcs_grpc_gen)
 file(MAKE_DIRECTORY ${_GCS_PROTO_OUT})
 
+# storage.proto annotates several bytes fields (notably ChecksummedData.content)
+# with `[ctype = CORD]`. Protobuf builds without Cord support (the common
+# conda-forge / vcpkg case) generate the std::string content() accessor as
+# PRIVATE and emit no usable public Cord accessor — making the field unreadable
+# ("content() is private"). Strip the annotation in-place before protoc runs so
+# the generated accessor is a plain public `const std::string& content()`. The
+# regex tolerates whitespace variants (`[ctype = CORD]`, `[ctype=CORD]`).
+file(READ ${_GCS_PROTO_ROOT}/google/storage/v2/storage.proto _gcs_storage_proto_src)
+string(REGEX REPLACE "\\[ctype *= *CORD\\]" "" _gcs_storage_proto_src "${_gcs_storage_proto_src}")
+file(WRITE ${_GCS_PROTO_ROOT}/google/storage/v2/storage.proto "${_gcs_storage_proto_src}")
+
 # Curated subset of protos to generate. storage.proto is the only one needing
 # the grpc plugin (it defines the Storage service); the rest are message-only
 # dependencies. Add entries here if protoc reports an unresolved import.
