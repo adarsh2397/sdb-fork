@@ -27,6 +27,7 @@
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <future>
 #include <stdexcept>
@@ -43,6 +44,31 @@ namespace v2 = google::storage::v2;
 std::string bucket_resource(std::string_view bucket)
 {
   return "projects/_/buckets/" + std::string(bucket);
+}
+
+/// Build the `x-goog-request-params` routing header value the GCS gRPC backend
+/// requires for ReadObject/GetObject (their google.api.routing annotation uses
+/// path_template "{bucket=**}"). Without this header the server rejects the RPC
+/// with INVALID_ARGUMENT ("an x-goog-request-params ... property must be
+/// provided"). The value is `bucket=<resource path>` with reserved characters
+/// percent-encoded (notably the slashes in "projects/_/buckets/<name>").
+/// google-cloud-cpp's generated stubs add this automatically; our hand-written
+/// stub must do it explicitly.
+std::string routing_params(std::string_view bucket)
+{
+  static constexpr char kHex[] = "0123456789ABCDEF";
+  std::string out             = "bucket=";
+  for (char c : bucket_resource(bucket)) {
+    auto uc = static_cast<unsigned char>(c);
+    if (std::isalnum(uc) || c == '-' || c == '_' || c == '.' || c == '~') {
+      out += c;
+    } else {
+      out += '%';
+      out += kHex[uc >> 4];
+      out += kHex[uc & 0x0F];
+    }
+  }
+  return out;
 }
 
 /// gRPC call-credentials plugin that reuses the existing s3_request_authorizer
@@ -170,6 +196,7 @@ gcs_grpc_object_state gcs_grpc_reactor::stat_object(std::string_view bucket, std
 
   grpc::ClientContext ctx;
   ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(_impl->timeout_s));
+  ctx.AddMetadata("x-goog-request-params", routing_params(bucket));
 
   v2::Object obj;
   auto status = _impl->stub->GetObject(&ctx, req, &obj);
@@ -197,6 +224,7 @@ std::size_t gcs_grpc_reactor::host_read(native_handle_type handle,
 
   grpc::ClientContext ctx;
   ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(_impl->timeout_s));
+  ctx.AddMetadata("x-goog-request-params", routing_params(handle->bucket));
 
   auto reader = _impl->stub->ReadObject(&ctx, req);
 
