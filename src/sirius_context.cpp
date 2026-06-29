@@ -781,7 +781,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
         grpc_cfg.creds                = std::move(gcs_provider);
         grpc_cfg.endpoint             = config_.gcs_config.grpc_endpoint;
         grpc_cfg.request_timeout_s    = req_timeout_s;
-        grpc_cfg.max_streams          = max_conns;
+        grpc_cfg.max_streams          = config_.gcs_config.grpc_max_streams;
         grpc_cfg.host_memory_resource = host_fsmr;
         gcs_ioctx_ = std::make_shared<sirius::io::gcs::gcs_grpc_ioctx>(std::move(grpc_cfg));
         SIRIUS_LOG_INFO("SiriusContext: GCS backend transport=grpc (endpoint={})",

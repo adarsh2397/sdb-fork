@@ -123,6 +123,7 @@ static void from_yaml(const YAML::Node& node, sirius::io::gcs_object_store_confi
   yaml::reader r(node, "gcs_config");
   r.optional("transport", opt.gcs_transport);
   r.optional("grpc_endpoint", opt.grpc_endpoint);
+  r.optional("grpc_max_streams", opt.grpc_max_streams, yaml::greater_than<std::size_t>{0});
   r.optional("hmac_access_key", opt.hmac_access_key);
   r.optional("hmac_secret_key", opt.hmac_secret_key);
   r.optional("use_metadata_server", opt.use_metadata_server);

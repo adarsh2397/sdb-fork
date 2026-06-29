@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -137,6 +138,14 @@ struct gcs_object_store_config {
   /// port given). Ignored unless @c gcs_transport == grpc. For DirectPath on a
   /// co-located VM, use "google-c2p:///storage.googleapis.com".
   std::string grpc_endpoint = "storage.googleapis.com";
+
+  /// Max concurrent ReadObject streams the gRPC reactor keeps in flight,
+  /// multiplexed over the single HTTP/2 channel. Ignored unless
+  /// @c gcs_transport == grpc. HTTP/2 streams are cheap (unlike curl
+  /// connections), so this defaults high — too low a value serializes
+  /// many-small-read scans (e.g. single-column COUNT over many row groups) into
+  /// latency-bound waves. Raise further if reads stay network-bound.
+  std::size_t grpc_max_streams = 128;
 
   /// GCS HMAC key ID (typically starts with "GOOG1E"). Ignored when
   /// @c use_metadata_server is true.
