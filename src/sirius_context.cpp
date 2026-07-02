@@ -783,10 +783,30 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
         grpc_cfg.request_timeout_s    = req_timeout_s;
         grpc_cfg.max_streams          = config_.gcs_config.grpc_max_streams;
         grpc_cfg.directpath           = config_.gcs_config.grpc_directpath;
+        grpc_cfg.num_channels         = config_.gcs_config.grpc_channels;
+        grpc_cfg.target_read_bytes    = config_.gcs_config.grpc_target_read_bytes;
         grpc_cfg.host_memory_resource = host_fsmr;
+        auto const& bidi_str          = config_.gcs_config.grpc_bidi_reads;
+        if (bidi_str == "off") {
+          grpc_cfg.bidi_reads = sirius::io::gcs::gcs_bidi_mode::off;
+        } else if (bidi_str == "on") {
+          grpc_cfg.bidi_reads = sirius::io::gcs::gcs_bidi_mode::on;
+        } else if (bidi_str == "auto") {
+          grpc_cfg.bidi_reads = sirius::io::gcs::gcs_bidi_mode::automatic;
+        } else {
+          throw std::invalid_argument(
+            "gcs_config.grpc_bidi_reads must be one of off|on|auto, got '" + bidi_str + "'");
+        }
         gcs_ioctx_ = std::make_shared<sirius::io::gcs::gcs_grpc_ioctx>(std::move(grpc_cfg));
-        SIRIUS_LOG_INFO("SiriusContext: GCS backend transport=grpc (endpoint={})",
-                        config_.gcs_config.grpc_endpoint);
+        SIRIUS_LOG_INFO(
+          "SiriusContext: GCS backend transport=grpc (endpoint={}, channels={}, max_streams={}, "
+          "bidi_reads={}, directpath={}, target_read_bytes={})",
+          config_.gcs_config.grpc_endpoint,
+          config_.gcs_config.grpc_channels,
+          config_.gcs_config.grpc_max_streams,
+          config_.gcs_config.grpc_bidi_reads,
+          config_.gcs_config.grpc_directpath,
+          config_.gcs_config.grpc_target_read_bytes);
       } else {
         // XML/HTTP async backend: the s3_reactor libcurl-multi loop drives all
         // concurrent range GETs on its own worker thread. Column chunks within a

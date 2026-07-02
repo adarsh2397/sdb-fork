@@ -66,6 +66,16 @@ class sirius_datasource : public cudf::io::datasource {
   std::future<std::unique_ptr<datasource::buffer>> host_read_async(size_t offset,
                                                                    size_t size) override;
 
+  // ---- Sirius extensions (not part of cudf::io::datasource) -----------------
+
+  /// Read ONE contiguous file range [offset, offset+sum(segments)) into a
+  /// scatter-gather list of destination segments (file order). Callers with
+  /// block-fragmented destinations use this to issue one transport request per
+  /// range instead of one per fragment. Backends without native SG support
+  /// transparently fall back to per-segment sub-reads.
+  std::future<size_t> host_read_segments_async(size_t offset,
+                                               std::vector<cudf::host_span<std::byte>> segments);
+
   std::unique_ptr<datasource::buffer> device_read(size_t offset,
                                                   size_t size,
                                                   rmm::cuda_stream_view stream) override;

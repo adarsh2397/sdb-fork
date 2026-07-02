@@ -85,6 +85,14 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
                                       size_t size,
                                       uint8_t* dst);
 
+  /// Read ONE contiguous file range [offset, offset+sum(segments)) into a
+  /// scatter-gather list of host destination segments (in file order).
+  /// Cache-aware like host_read_async; backends without native SG support
+  /// fall back to one sub-read per segment.
+  std::future<size_t> host_read_segments_async(sirius_io_object& obj,
+                                               size_t offset,
+                                               std::vector<cudf::host_span<std::byte>> segments);
+
   size_t device_read(
     sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst, rmm::cuda_stream_view stream);
 
@@ -118,6 +126,15 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
                                          std::vector<cudf::io::text::byte_range_info> const& ranges,
                                          std::span<cudf::host_span<std::byte>> dst,
                                          io_completion_handler handler) = 0;
+
+  /// One contiguous file range scattered into @p segments. Default
+  /// implementation splits into one host_read_async_io per segment; backends
+  /// with a native single-request SG path (gRPC ReadObject cursor fill)
+  /// override this.
+  virtual void host_read_segments_async_io(sirius_io_object& obj,
+                                           size_t offset,
+                                           std::vector<cudf::host_span<std::byte>> segments,
+                                           io_completion_handler handler);
 
   // -- Physical range alignment ------------------------------------------------
 

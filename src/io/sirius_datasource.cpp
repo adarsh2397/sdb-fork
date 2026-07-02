@@ -64,6 +64,12 @@ std::future<size_t> sirius_datasource::host_read_async(size_t offset, size_t siz
   return _io_ctx->host_read_async(*_io_object, offset, size, dst);
 }
 
+std::future<size_t> sirius_datasource::host_read_segments_async(
+  size_t offset, std::vector<cudf::host_span<std::byte>> segments)
+{
+  return _io_ctx->host_read_segments_async(*_io_object, offset, std::move(segments));
+}
+
 std::future<std::unique_ptr<cudf::io::datasource::buffer>> sirius_datasource::host_read_async(
   size_t offset, size_t size)
 {

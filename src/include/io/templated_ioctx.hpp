@@ -276,6 +276,52 @@ class templated_ioctx : public sirius_ioctx {
     }
   }
 
+  // -- Scatter-gather host reads ---------------------------------------------
+  //
+  // One contiguous file range delivered into multiple destination segments.
+  // If the reactor exposes a native SG entry point (host_read_sg_async), the
+  // whole range goes out as ONE transport request; otherwise fall back to the
+  // generic per-segment split in the sirius_ioctx base.
+
+  void host_read_segments_async_io(sirius_io_object& obj,
+                                   size_t offset,
+                                   std::vector<cudf::host_span<std::byte>> segments,
+                                   io_completion_handler handler) override
+  {
+    if constexpr (requires(Reactor r, host_read_sg_req<native_handle_type> req) {
+                    r.host_read_sg_async(std::move(req));
+                  }) {
+      auto& tobj      = as_typed(obj);
+      auto file_size  = tobj.size();
+      size_t capacity = file_size > offset ? file_size - offset : size_t{0};
+
+      // Trim segments that overrun EOF (mirrors host_read_async_io clipping).
+      size_t total = 0;
+      for (auto& s : segments) {
+        if (total >= capacity) {
+          s = s.subspan(0, 0);
+          continue;
+        }
+        if (total + s.size() > capacity) { s = s.subspan(0, capacity - total); }
+        total += s.size();
+      }
+
+      auto ctx = request_context::create(total == 0 ? 0 : 1, total, std::move(handler));
+      if (!ctx) return;
+
+      host_read_sg_req<native_handle_type> req;
+      req.handle   = tobj.host_handle();
+      req.offset   = offset;
+      req.size     = total;
+      req.segments = std::move(segments);
+      req.ctx      = std::move(ctx);
+      next_reactor().host_read_sg_async(std::move(req));
+    } else {
+      sirius_ioctx::host_read_segments_async_io(
+        obj, offset, std::move(segments), std::move(handler));
+    }
+  }
+
   cudf::io::text::byte_range_info compute_physical_range(cudf::io::text::byte_range_info logical,
                                                          size_t file_size) const override
   {

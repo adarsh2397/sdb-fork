@@ -77,32 +77,45 @@ class gcs_grpc_io_object : public sirius_io_object {
   std::shared_ptr<const gcs_grpc_object_state> _state;
 };
 
+/// BidiReadObject usage policy (Rapid Storage multi-range fast path).
+enum class gcs_bidi_mode {
+  off,       ///< never use BidiReadObject
+  on,        ///< always use it; errors surface to the caller
+  automatic  ///< probe per bucket; fall back to unary ReadObject when unsupported
+};
+
 /**
- * @brief Native GCS gRPC reactor (google.storage.v2 ReadObject).
+ * @brief Native GCS gRPC reactor (google.storage.v2 ReadObject/BidiReadObject).
  *
  * Models the @c io_reactor_c concept consumed by @c templated_ioctx, exactly
  * like @c s3_reactor — so the scan path, prefetch cache, and pipeline are
- * unchanged; only the transport differs. Reads issue server-streaming
- * @c ReadObject RPCs over a gRPC channel (DirectPath when the VM + bucket are
- * co-located), draining @c ReadObjectResponse chunks into a caller buffer
- * (host path) or a borrowed pinned staging block followed by an async H2D copy
- * (device path), mirroring s3_reactor's pinned-staging + stream-callback model.
+ * unchanged; only the transport differs.
+ *
+ * Transport architecture (per instance):
+ *   - A pool of @c num_channels gRPC channels ("lanes"), each with its own
+ *     CompletionQueue + dedicated worker thread. Distinct channel args force
+ *     separate TCP connections, removing both the per-channel HTTP/2
+ *     concurrent-stream cap and the single-worker deserialize/memcpy ceiling.
+ *   - Reads are submitted to lanes round-robin; each lane runs a bounded
+ *     in-flight window of @c max_streams / @c num_channels concurrent streams.
+ *   - When @c bidi_reads permits, ranges for the same object multiplex over a
+ *     persistent @c BidiReadObject stream per (lane, object) — the Rapid
+ *     Storage (zonal bucket) fast path. Otherwise each range is a
+ *     server-streaming @c ReadObject.
+ *   - Transient failures (UNAVAILABLE, DEADLINE_EXCEEDED, ABORTED,
+ *     RESOURCE_EXHAUSTED, INTERNAL) retry with exponential backoff + jitter,
+ *     resuming at the last delivered byte.
  *
  * Auth reuses the existing @c s3_request_authorizer chain (e.g.
  * @c gcs_metadata_server_authorizer): the bearer token it produces is attached
  * to each RPC as gRPC call credentials rather than an HTTP header.
- *
- * @note BidiReadObject (multi-range, Rapid Storage fast path) is private
- *       preview at time of writing; this reactor uses the GA single-range
- *       @c ReadObject and is structured so the per-range submit can later fan
- *       into one bidi stream.
  */
 class gcs_grpc_reactor {
  public:
   struct config {
     std::shared_ptr<sirius::io::s3::s3_request_authorizer> creds;
     std::string endpoint{"storage.googleapis.com"};  ///< gRPC target (DirectPath: google-c2p:///)
-    /// When true, build the channel for DirectPath: target the c2p resolver
+    /// When true, build channels for DirectPath: target the c2p resolver
     /// ("google-c2p:///<host>") with GoogleDefaultCredentials (ALTS handshake +
     /// compute-SA auth), bypassing the GFE on a co-located GCE VM. Auth in this
     /// mode is handled by GoogleDefaultCredentials, so @c creds is not used for
@@ -111,17 +124,38 @@ class gcs_grpc_reactor {
     /// back to CFE/TLS if DirectPath cannot be negotiated.
     bool directpath{false};
     long request_timeout_s{60};
-    std::size_t max_streams{16};  ///< concurrent ReadObject streams in flight
+    std::size_t max_streams{16};   ///< TOTAL concurrent streams in flight (split across lanes)
+    std::size_t num_channels{4};   ///< gRPC channels, each with its own CQ + worker thread
+    gcs_bidi_mode bidi_reads{gcs_bidi_mode::automatic};
+    /// Large scatter-gather reads are split into sub-reads of this size so
+    /// they parallelize across streams/lanes (bidi ranges also obey it).
+    std::size_t target_read_bytes{16UL << 20};
     cucascade::memory::fixed_size_host_memory_resource* host_memory_resource{nullptr};
     std::size_t max_retry_attempts{4};
     std::chrono::milliseconds retry_backoff_base{50};
     std::chrono::milliseconds retry_jitter{20};
   };
 
-  using native_handle_type   = gcs_grpc_native_handle;
-  using io_object_type       = gcs_grpc_io_object;
-  using device_read_req_type = device_read_req<native_handle_type>;
-  using host_read_req_type   = host_read_req<native_handle_type>;
+  /// Cumulative activity counters — one snapshot per reactor. Exposed for the
+  /// periodic stats log and tests.
+  struct stats_snapshot {
+    std::uint64_t bytes_read{0};
+    std::uint64_t ranges_completed{0};   ///< logical ranges delivered (unary + bidi)
+    std::uint64_t sg_reads{0};           ///< scatter-gather requests accepted
+    std::uint64_t unary_streams{0};      ///< ReadObject streams started
+    std::uint64_t bidi_sessions{0};      ///< BidiReadObject streams opened
+    std::uint64_t bidi_ranges{0};        ///< ranges submitted over bidi sessions
+    std::uint64_t bidi_fallbacks{0};     ///< ranges rerouted bidi -> unary
+    std::uint64_t retries{0};            ///< retry attempts scheduled
+    std::uint64_t retry_exhausted{0};    ///< ranges failed after max retries
+    std::uint64_t device_chunks{0};      ///< device-path chunks (staged H2D)
+  };
+
+  using native_handle_type    = gcs_grpc_native_handle;
+  using io_object_type        = gcs_grpc_io_object;
+  using device_read_req_type  = device_read_req<native_handle_type>;
+  using host_read_req_type    = host_read_req<native_handle_type>;
+  using host_read_sg_req_type = host_read_sg_req<native_handle_type>;
 
   explicit gcs_grpc_reactor(config cfg);
   ~gcs_grpc_reactor();
@@ -137,6 +171,10 @@ class gcs_grpc_reactor {
   void host_read_async(host_read_req_type req);
   void host_enqueue_bulk(std::span<host_read_req_type> batch);
   void enqueue_bulk(std::span<device_read_req_type> batch);  // device reads
+
+  /// Scatter-gather read: ONE contiguous file range delivered into multiple
+  /// destination segments (native SG hook consumed by templated_ioctx).
+  void host_read_sg_async(host_read_sg_req_type req);
 
   void interrupt();
   void shutdown();
@@ -164,9 +202,11 @@ class gcs_grpc_reactor {
     return _bytes_read_total.load(std::memory_order_relaxed);
   }
 
+  [[nodiscard]] stats_snapshot stats() const noexcept;
+
  private:
   struct impl;                  // hides grpc/proto headers from this TU
-  std::unique_ptr<impl> _impl;  // channel, stub, completion-queue worker
+  std::unique_ptr<impl> _impl;  // channel lanes, CQ workers, bidi sessions
   config _cfg;
   std::atomic<std::uint64_t> _bytes_read_total{0};
 };

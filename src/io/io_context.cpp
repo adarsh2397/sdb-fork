@@ -212,6 +212,77 @@ std::future<size_t> sirius_ioctx::host_read_async(sirius_io_object& obj,
   return promise->get_future();
 }
 
+std::future<size_t> sirius_ioctx::host_read_segments_async(
+  sirius_io_object& obj, size_t offset, std::vector<cudf::host_span<std::byte>> segments)
+{
+  size_t total = 0;
+  for (auto const& s : segments)
+    total += s.size();
+
+  if (_cache && total > 0) {
+    if (auto view = _cache->read(obj, offset, total, nullptr); view) {
+      auto slices = view.slice(offset, total);
+      try {
+        sg_write_cursor cur{segments};
+        for (auto const& s : slices) {
+          cur.append(s.data(), s.size());
+        }
+        auto copied = cur.written;
+        return std::async(std::launch::deferred, [copied]() { return copied; });
+      } catch (...) {
+        return std::async(std::launch::deferred, [e = std::current_exception()]() -> size_t {
+          std::rethrow_exception(e);
+        });
+      }
+    }
+  }
+
+  auto promise = std::make_shared<std::promise<size_t>>();
+  host_read_segments_async_io(
+    obj, offset, std::move(segments), [promise](size_t bytes_transferred, std::exception_ptr ep) {
+      if (ep) {
+        promise->set_exception(std::move(ep));
+      } else {
+        promise->set_value(bytes_transferred);
+      }
+    });
+  return promise->get_future();
+}
+
+void sirius_ioctx::host_read_segments_async_io(sirius_io_object& obj,
+                                               size_t offset,
+                                               std::vector<cudf::host_span<std::byte>> segments,
+                                               io_completion_handler handler)
+{
+  // Generic fallback: one sub-read per destination segment. Backends with a
+  // native scatter-gather path override this with a single transport request.
+  size_t total = 0;
+  for (auto const& s : segments)
+    total += s.size();
+
+  size_t n_segs =
+    std::count_if(segments.begin(), segments.end(), [](auto const& s) { return s.size() > 0; });
+  auto ctx = request_context::create(n_segs, total, std::move(handler));
+  if (!ctx) return;
+
+  size_t cur = offset;
+  for (auto const& s : segments) {
+    if (s.size() == 0) continue;
+    host_read_async_io(obj,
+                       cur,
+                       s.size(),
+                       reinterpret_cast<uint8_t*>(s.data()),
+                       [ctx](size_t, std::exception_ptr ep) {
+                         if (ep) {
+                           ctx->chunk_failed(std::move(ep));
+                         } else {
+                           ctx->chunk_done();
+                         }
+                       });
+    cur += s.size();
+  }
+}
+
 size_t sirius_ioctx::device_read(
   sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst, rmm::cuda_stream_view stream)
 {

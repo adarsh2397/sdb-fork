@@ -139,13 +139,30 @@ struct gcs_object_store_config {
   /// co-located VM, use "google-c2p:///storage.googleapis.com".
   std::string grpc_endpoint = "storage.googleapis.com";
 
-  /// Max concurrent ReadObject streams the gRPC reactor keeps in flight,
-  /// multiplexed over the single HTTP/2 channel. Ignored unless
+  /// Max concurrent read streams the gRPC reactor keeps in flight in TOTAL,
+  /// split evenly across @c grpc_channels. Ignored unless
   /// @c gcs_transport == grpc. HTTP/2 streams are cheap (unlike curl
   /// connections), so this defaults high — too low a value serializes
   /// many-small-read scans (e.g. single-column COUNT over many row groups) into
   /// latency-bound waves. Raise further if reads stay network-bound.
   std::size_t grpc_max_streams = 128;
+
+  /// Number of gRPC channels ("lanes"), each with its own TCP/ALTS connection,
+  /// CompletionQueue and worker thread. Removes the per-channel HTTP/2
+  /// concurrent-stream cap and the single-thread response-memcpy ceiling.
+  /// Ignored unless @c gcs_transport == grpc.
+  std::size_t grpc_channels = 4;
+
+  /// BidiReadObject policy (Rapid Storage multi-range fast path):
+  /// "auto" (default) probes per bucket and falls back to unary ReadObject
+  /// when unsupported; "on" always uses it (errors surface); "off" never.
+  /// Ignored unless @c gcs_transport == grpc.
+  std::string grpc_bidi_reads = "auto";
+
+  /// Target size for one transport read. Larger scatter-gather scan reads are
+  /// split into sub-reads of ~this size so they parallelize across
+  /// streams/channels. Ignored unless @c gcs_transport == grpc.
+  std::size_t grpc_target_read_bytes = 16UL << 20;  // 16 MiB
 
   /// When true, build the gRPC channel for DirectPath: c2p resolver
   /// ("google-c2p:///<grpc_endpoint>") + GoogleDefaultCredentials (ALTS + the

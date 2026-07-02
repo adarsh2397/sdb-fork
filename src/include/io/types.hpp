@@ -18,17 +18,22 @@
 
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/text/byte_range_info.hpp>
+#include <cudf/utilities/span.hpp>
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
+#include <cstring>
 #include <exception>
 #include <functional>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace sirius::io {
 
@@ -244,6 +249,58 @@ struct host_read_req {
   size_t size{0};
   uint8_t* dst{nullptr};
   std::shared_ptr<request_context> ctx;
+};
+
+/**
+ * @brief Descriptor for one contiguous FILE range delivered into a
+ *        scatter-gather list of host destination segments (in file order).
+ *
+ * Lets a caller whose destination is block-fragmented (e.g. a
+ * fixed_size_host_memory_resource multi-block allocation) issue ONE transport
+ * request per file range instead of one per destination fragment. Reactors
+ * that stream responses in offset order (S3 GET, GCS ReadObject) fill the
+ * segments with a simple cursor walk. sum(segments[i].size()) == size.
+ */
+template <typename Handle>
+struct host_read_sg_req {
+  Handle handle{};
+  size_t offset{0};  ///< file offset of the range
+  size_t size{0};    ///< total bytes == sum of segment sizes
+  std::vector<cudf::host_span<std::byte>> segments;
+  std::shared_ptr<request_context> ctx;
+};
+
+/**
+ * @brief Write cursor over a scatter-gather segment list.  Appends
+ *        stream-ordered payload bytes across segment boundaries.
+ */
+struct sg_write_cursor {
+  std::span<cudf::host_span<std::byte> const> segments;
+  size_t seg_idx{0};
+  size_t seg_off{0};
+  size_t written{0};
+
+  /// Copy up to @p n bytes from @p src into the segments; returns bytes copied
+  /// (less than @p n only when the segment list is exhausted).
+  size_t append(void const* src, size_t n)
+  {
+    auto const* p = static_cast<std::byte const*>(src);
+    size_t copied = 0;
+    while (copied < n && seg_idx < segments.size()) {
+      auto seg     = segments[seg_idx];
+      size_t avail = seg.size() - seg_off;
+      size_t take  = std::min(n - copied, avail);
+      std::memcpy(seg.data() + seg_off, p + copied, take);
+      copied += take;
+      seg_off += take;
+      if (seg_off == seg.size()) {
+        ++seg_idx;
+        seg_off = 0;
+      }
+    }
+    written += copied;
+    return copied;
+  }
 };
 
 }  // namespace sirius::io

@@ -1061,6 +1061,36 @@ void parquet_scan_task::read_range_into_allocation(
   std::unique_ptr<multiple_blocks_allocation>& allocation,
   std::vector<std::future<std::size_t>>& read_futures)
 {
+  // Fast path: sirius datasources take the WHOLE range as one scatter-gather
+  // read over the block-fragmented destination, so the transport issues one
+  // request per merged column-chunk range instead of one per 1 MiB block
+  // (backends without native SG support split per segment inside the ioctx).
+  if (auto* sds = dynamic_cast<sirius::io::sirius_datasource*>(_datasource.get());
+      sds != nullptr) {
+    std::vector<cudf::host_span<std::byte>> segments;
+    auto remaining_bytes = n_bytes;
+    while (remaining_bytes > 0) {
+      auto const bytes_in_block = std::min(
+        remaining_bytes, data_blocks_accessor.block_size - data_blocks_accessor.offset_in_block);
+      auto* p =
+        reinterpret_cast<std::byte*>(allocation->get_blocks()[data_blocks_accessor.block_index]) +
+        data_blocks_accessor.offset_in_block;
+      segments.emplace_back(p, bytes_in_block);
+      remaining_bytes -= bytes_in_block;
+      data_blocks_accessor.offset_in_block += bytes_in_block;
+      if (data_blocks_accessor.offset_in_block == data_blocks_accessor.block_size) {
+        ++data_blocks_accessor.block_index;
+        data_blocks_accessor.offset_in_block = 0;
+      }
+    }
+    SIRIUS_LOG_TRACE("[parquet_scan_task] SG read: offset={} bytes={} segments={}",
+                     file_offset,
+                     n_bytes,
+                     segments.size());
+    read_futures.push_back(sds->host_read_segments_async(file_offset, std::move(segments)));
+    return;
+  }
+
   auto remaining_bytes = n_bytes;
   auto current_offset  = file_offset;
 
