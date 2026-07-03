@@ -784,13 +784,12 @@ struct gcs_grpc_reactor::impl {
     s.ctx = std::make_unique<grpc::ClientContext>();
     // Long-lived multi-range stream: no per-call deadline (channel keepalive
     // detects dead peers); ranges themselves are retried on stream failure.
-    // A pending routing_token (from a Rapid Storage redirect) is appended to
-    // the routing header AND set in the spec on the first write below.
-    auto params = routing_params(s.handle->bucket);
-    if (!s.routing_token.empty()) {
-      params += "&routing_token=" + percent_encode(s.routing_token);
-    }
-    s.ctx->AddMetadata("x-goog-request-params", params);
+    // The routing header is ALWAYS just `bucket=...`. A pending Rapid Storage
+    // routing_token goes ONLY into BidiReadObjectSpec.routing_token on the first
+    // write (see pump_session_writes), matching google-cloud-go's
+    // MultiRangeDownloader redirect handling (bidiObject.RoutingToken = …).
+    // Do NOT also put the token in x-goog-request-params — that misroutes.
+    s.ctx->AddMetadata("x-goog-request-params", routing_params(s.handle->bucket));
     s.saw_response = false;
     s.state        = bidi_session::phase::starting;
     s.rw           = s.ln->stub->PrepareAsyncBidiReadObject(s.ctx.get(), &s.ln->cq);
@@ -979,6 +978,28 @@ struct gcs_grpc_reactor::impl {
       redirect.has_value() &&
       (!redirect->routing_token().empty() || redirect->has_read_handle()) &&
       s.redirects < kMaxBidiRedirects;
+
+    // Decisive diagnostic for the "not available from this location" case: was
+    // the redirect detail actually present + parsed, and what did it carry?
+    // detail_bytes==0 => server sent no grpc-status-details-bin (parse can't
+    // help — look at trailing metadata); parsed=0 with detail_bytes>0 => the
+    // detail is a different Any type than BidiReadObjectRedirectedError.
+    if (!s.status.ok()) {
+      SIRIUS_LOG_INFO(
+        "gcs_grpc: bidi stream ended gs://{}/{} status={} \"{}\" saw_response={} "
+        "detail_bytes={} redirect_parsed={} routing_token_len={} read_handle_present={} "
+        "redirects_so_far={}",
+        s.handle->bucket,
+        s.handle->key,
+        static_cast<int>(s.status.error_code()),
+        s.status.error_message(),
+        s.saw_response,
+        s.status.error_details().size(),
+        redirect.has_value(),
+        redirect.has_value() ? redirect->routing_token().size() : 0,
+        redirect.has_value() && redirect->has_read_handle(),
+        s.redirects);
+    }
 
     if (stop) {
       for (auto& rs : leftovers) {
