@@ -799,8 +799,32 @@ struct gcs_grpc_reactor::impl {
     // token typically carries base64 '+' '/' '=') corrupts routing and the
     // stream re-redirects forever. The bucket stays percent-encoded (proven
     // accepted — unary ReadObject uses the same routing_params and works).
-    auto params = routing_params(s.handle->bucket);
+    // Build x-goog-request-params EXACTLY like google-cloud-cpp's OpenObject
+    // RequestParams() (storage/internal/async/open_object.cc): BOTH the bucket
+    // and the routing_token are RAW — NOT percent-encoded. That file emits
+    //   absl::StrCat("bucket=", read_spec.bucket(), "&routing_token=", token)
+    // i.e. `bucket=projects/_/buckets/<name>&routing_token=<token>` with literal
+    // slashes. This is the hand-written bidi-read open path and is what the
+    // zonal server's redirect routing expects. Percent-encoding the bucket (as
+    // routing_params() does for the unary path, which the server tolerates
+    // there) makes the redirect loop forever. Do NOT switch this to
+    // routing_params().
+    std::string params = "bucket=" + bucket_resource(s.handle->bucket);
     if (!s.routing_token.empty()) { params += "&routing_token=" + s.routing_token; }
+    // Ground-truth wire dump on any tokened (re)open: the EXACT x-goog-request-
+    // params value the reopened stream carries, so we can compare byte-for-byte
+    // against what a working client sends instead of guessing at placement.
+    if (!s.routing_token.empty()) {
+      SIRIUS_LOG_INFO(
+        "gcs_grpc: bidi (re)open gs://{}/{} redirect#{} x-goog-request-params=[{}] "
+        "(routing_token {} bytes raw, read_handle {})",
+        s.handle->bucket,
+        s.handle->key,
+        s.redirects,
+        params,
+        s.routing_token.size(),
+        s.read_handle ? "set" : "unset");
+    }
     s.ctx->AddMetadata("x-goog-request-params", params);
     s.saw_response = false;
     s.state        = bidi_session::phase::starting;
