@@ -787,17 +787,20 @@ struct gcs_grpc_reactor::impl {
     //
     // Rapid Storage redirect: a pending routing_token must be echoed in BOTH
     // the x-goog-request-params header AND BidiReadObjectSpec.routing_token
-    // (set on the first write, see pump_session_writes). google-cloud-go's
-    // MultiRangeDownloader does the same — its openAndSendReq() reapplies the
-    // token to the outgoing context via contextMetadataFromBidiReadObject(req)
-    // (i.e. the header) in addition to bidiObject.RoutingToken. Spec-only does
-    // NOT work: without the token in the routing header the DirectPath/c2p
-    // layer keeps routing the reopened stream to the same backend, which
-    // redirects again (observed: redirects_so_far hits the cap and fails).
-    // The value is percent-encoded like the bucket param (tokens can contain
-    // reserved characters that would otherwise corrupt the header).
+    // (set on the first write, see pump_session_writes). Spec-only does NOT
+    // work: without the token in the routing header the DirectPath/c2p layer
+    // keeps routing the reopened stream to the same backend, which redirects
+    // again (observed: redirects_so_far hits the cap and fails).
+    //
+    // CRITICAL: the routing_token is appended RAW — it must NOT be
+    // percent-encoded, even though the bucket param is. google/java-storage has
+    // an explicit test (`redirectTokenMustNotBeUrlEncoded`) asserting the
+    // server-issued token is passed through verbatim; encoding it (a 64-char
+    // token typically carries base64 '+' '/' '=') corrupts routing and the
+    // stream re-redirects forever. The bucket stays percent-encoded (proven
+    // accepted — unary ReadObject uses the same routing_params and works).
     auto params = routing_params(s.handle->bucket);
-    if (!s.routing_token.empty()) { params += "&routing_token=" + percent_encode(s.routing_token); }
+    if (!s.routing_token.empty()) { params += "&routing_token=" + s.routing_token; }
     s.ctx->AddMetadata("x-goog-request-params", params);
     s.saw_response = false;
     s.state        = bidi_session::phase::starting;
