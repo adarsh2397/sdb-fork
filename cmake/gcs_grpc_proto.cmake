@@ -30,7 +30,16 @@
 
 include(FetchContent)
 
-find_package(Protobuf REQUIRED)
+# Protobuf MUST be found in CONFIG mode, and BEFORE gRPC. The legacy
+# FindProtobuf module defines only a PARTIAL protobuf::* imported-target set;
+# modern gRPCConfig then runs find_dependency(protobuf CONFIG), whose
+# protobuf-targets.cmake sees that partial set and aborts with
+#   "Some (but not all) targets in this export set were already defined."
+# (Surfaced by the grpc-cpp 1.51 -> libgrpc >= 1.62 upgrade; the old pairing
+# happened to define matching sets.) MODULE_COMPATIBLE keeps the legacy
+# Protobuf_* variables available for any downstream consumers.
+set(protobuf_MODULE_COMPATIBLE ON)
+find_package(Protobuf CONFIG REQUIRED)
 find_package(gRPC CONFIG REQUIRED)
 
 # protoc + grpc_cpp_plugin come from the conda-forge libgrpc / vcpkg grpc
