@@ -33,7 +33,7 @@ include(FetchContent)
 find_package(Protobuf REQUIRED)
 find_package(gRPC CONFIG REQUIRED)
 
-# protoc + grpc_cpp_plugin come from the conda-forge grpc-cpp / vcpkg grpc
+# protoc + grpc_cpp_plugin come from the conda-forge libgrpc / vcpkg grpc
 # toolchain. Prefer the imported targets when present, fall back to the binaries.
 if(TARGET protobuf::protoc)
   set(_GCS_PROTOC $<TARGET_FILE:protobuf::protoc>)

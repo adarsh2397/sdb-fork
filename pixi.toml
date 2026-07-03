@@ -31,10 +31,17 @@ llvm-tools = "21.*"
 pkg-config = "*"
 mold = "*"
 libprotobuf = "*"
-# gRPC C++ runtime + protoc grpc_cpp_plugin for the native GCS gRPC backend
-# (google.storage.v2 ReadObject). conda-forge ships the toolchain (protoc +
-# grpc_cpp_plugin) and runtime under grpc-cpp / libgrpc.
-grpc-cpp = "*"
+# gRPC C++ runtime + grpc_cpp_plugin for the native GCS gRPC backend
+# (google.storage.v2 ReadObject/BidiReadObject). MUST be conda-forge `libgrpc`
+# (the current package: libs + headers + codegen plugins), NOT the legacy
+# `grpc-cpp` name — that package is frozen at ~1.51, whose core predates
+# RLS-in-xDS being enabled (1.56) and has the uppercase X-Google-RLS-Data
+# header bug; both break the Rapid Storage (zonal bucket) BidiReadObject
+# redirect routing (symptoms: endless "not available from this location"
+# redirect loop; INTERNAL "illegal header key: X-Google-RLS-Data" when forced
+# with GRPC_EXPERIMENTAL_XDS_RLS_LB=true). >=1.62 keeps clear of the
+# experimental-RLS era with margin.
+libgrpc = ">=1.62"
 rust = "*"
 
 [feature.dev-libs.dependencies]
