@@ -784,12 +784,21 @@ struct gcs_grpc_reactor::impl {
     s.ctx = std::make_unique<grpc::ClientContext>();
     // Long-lived multi-range stream: no per-call deadline (channel keepalive
     // detects dead peers); ranges themselves are retried on stream failure.
-    // The routing header is ALWAYS just `bucket=...`. A pending Rapid Storage
-    // routing_token goes ONLY into BidiReadObjectSpec.routing_token on the first
-    // write (see pump_session_writes), matching google-cloud-go's
-    // MultiRangeDownloader redirect handling (bidiObject.RoutingToken = …).
-    // Do NOT also put the token in x-goog-request-params — that misroutes.
-    s.ctx->AddMetadata("x-goog-request-params", routing_params(s.handle->bucket));
+    //
+    // Rapid Storage redirect: a pending routing_token must be echoed in BOTH
+    // the x-goog-request-params header AND BidiReadObjectSpec.routing_token
+    // (set on the first write, see pump_session_writes). google-cloud-go's
+    // MultiRangeDownloader does the same — its openAndSendReq() reapplies the
+    // token to the outgoing context via contextMetadataFromBidiReadObject(req)
+    // (i.e. the header) in addition to bidiObject.RoutingToken. Spec-only does
+    // NOT work: without the token in the routing header the DirectPath/c2p
+    // layer keeps routing the reopened stream to the same backend, which
+    // redirects again (observed: redirects_so_far hits the cap and fails).
+    // The value is percent-encoded like the bucket param (tokens can contain
+    // reserved characters that would otherwise corrupt the header).
+    auto params = routing_params(s.handle->bucket);
+    if (!s.routing_token.empty()) { params += "&routing_token=" + percent_encode(s.routing_token); }
+    s.ctx->AddMetadata("x-goog-request-params", params);
     s.saw_response = false;
     s.state        = bidi_session::phase::starting;
     s.rw           = s.ln->stub->PrepareAsyncBidiReadObject(s.ctx.get(), &s.ln->cq);
