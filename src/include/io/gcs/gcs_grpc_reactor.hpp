@@ -146,6 +146,7 @@ class gcs_grpc_reactor {
     std::uint64_t bidi_sessions{0};      ///< BidiReadObject streams opened
     std::uint64_t bidi_ranges{0};        ///< ranges submitted over bidi sessions
     std::uint64_t bidi_fallbacks{0};     ///< ranges rerouted bidi -> unary
+    std::uint64_t bidi_redirects{0};     ///< Rapid Storage routing_token redirects followed
     std::uint64_t retries{0};            ///< retry attempts scheduled
     std::uint64_t retry_exhausted{0};    ///< ranges failed after max retries
     std::uint64_t device_chunks{0};      ///< device-path chunks (staged H2D)

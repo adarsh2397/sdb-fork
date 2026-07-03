@@ -23,6 +23,7 @@
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/security/credentials.h>
 
+#include "google/rpc/status.pb.h"
 #include "google/storage/v2/storage.grpc.pb.h"
 #include "google/storage/v2/storage.pb.h"
 
@@ -35,6 +36,7 @@
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <semaphore>
 #include <stdexcept>
@@ -57,6 +59,10 @@ constexpr std::size_t kBidiMaxOutstandingPerSession = 128;
 constexpr std::size_t kMaxRangesPerWrite            = 64;
 constexpr std::size_t kMaxSessionsPerLane           = 64;
 constexpr auto kStatsLogInterval                    = std::chrono::seconds(10);
+/// Rapid Storage may redirect a bidi stream (routing_token handshake) more than
+/// once as tokens refresh; cap distinct from hard-failure retries so a genuine
+/// "unreachable location" loop still terminates.
+constexpr std::size_t kMaxBidiRedirects = 5;
 
 /// Build the gRPC resource path the v2 API expects for a bucket.
 std::string bucket_resource(std::string_view bucket)
@@ -71,11 +77,13 @@ std::string bucket_resource(std::string_view bucket)
 /// `bucket=<resource path>` with reserved characters percent-encoded (notably
 /// the slashes in "projects/_/buckets/<name>"). google-cloud-cpp's generated
 /// stubs add this automatically; our hand-written stub must do it explicitly.
-std::string routing_params(std::string_view bucket)
+/// Percent-encode reserved characters (RFC 3986 unreserved set passes through).
+std::string percent_encode(std::string_view in)
 {
   static constexpr char kHex[] = "0123456789ABCDEF";
-  std::string out              = "bucket=";
-  for (char c : bucket_resource(bucket)) {
+  std::string out;
+  out.reserve(in.size());
+  for (char c : in) {
     auto uc = static_cast<unsigned char>(c);
     if (std::isalnum(uc) || c == '-' || c == '_' || c == '.' || c == '~') {
       out += c;
@@ -86,6 +94,11 @@ std::string routing_params(std::string_view bucket)
     }
   }
   return out;
+}
+
+std::string routing_params(std::string_view bucket)
+{
+  return "bucket=" + percent_encode(bucket_resource(bucket));
 }
 
 /// gRPC call-credentials plugin that reuses the existing s3_request_authorizer
@@ -163,6 +176,25 @@ bool is_bidi_unsupported(grpc::StatusCode code)
     default:
       return false;
   }
+}
+
+/// Rapid Storage redirect handshake: a zonal bucket aborts a fresh
+/// BidiReadObject stream and returns a BidiReadObjectRedirectedError detail
+/// carrying a routing_token (and usually a read_handle) that the client must
+/// echo back when reopening the stream so it is routed to the right location.
+/// The detail rides in the `grpc-status-details-bin` trailer, which gRPC
+/// surfaces as the serialized google.rpc.Status via error_details().
+std::optional<v2::BidiReadObjectRedirectedError> extract_bidi_redirect(grpc::Status const& status)
+{
+  auto const& details = status.error_details();
+  if (details.empty()) return std::nullopt;
+  google::rpc::Status rpc_status;
+  if (!rpc_status.ParseFromString(details)) return std::nullopt;
+  for (auto const& any : rpc_status.details()) {
+    v2::BidiReadObjectRedirectedError redirect;
+    if (any.UnpackTo(&redirect)) { return redirect; }
+  }
+  return std::nullopt;
 }
 
 std::chrono::milliseconds backoff_for_attempt(std::size_t attempt,
@@ -294,7 +326,13 @@ struct gcs_grpc_reactor::impl {
     bool write_inflight{false};
     bool counted{false};       ///< occupies an in-flight window slot
     bool saw_response{false};  ///< any response arrived on the CURRENT stream
-    std::size_t attempts{0};   ///< stream (re)starts after failures
+    std::size_t attempts{0};   ///< stream (re)starts after transient failures
+    std::size_t redirects{0};  ///< Rapid Storage routing_token redirects followed
+
+    // Rapid Storage redirect state, echoed on the next stream open so the
+    // server routes to the correct location / resumes without revalidation.
+    std::string routing_token;              ///< from BidiReadObjectRedirectedError
+    std::optional<std::string> read_handle;  ///< bytes; opaque server handle
 
     std::int64_t next_read_id{1};
     std::deque<std::unique_ptr<range_state>> pending;
@@ -407,6 +445,7 @@ struct gcs_grpc_reactor::impl {
   std::atomic<std::uint64_t> bidi_sessions_opened{0};
   std::atomic<std::uint64_t> bidi_ranges{0};
   std::atomic<std::uint64_t> bidi_fallbacks{0};
+  std::atomic<std::uint64_t> bidi_redirects{0};
   std::atomic<std::uint64_t> retries{0};
   std::atomic<std::uint64_t> retry_exhausted{0};
   std::atomic<std::uint64_t> device_chunks{0};
@@ -415,6 +454,7 @@ struct gcs_grpc_reactor::impl {
   std::atomic<bool> logged_first_unary{false};
   std::atomic<bool> logged_first_sg{false};
   std::atomic<bool> logged_first_device{false};
+  std::atomic<bool> logged_first_redirect{false};
 
   // Periodic throughput log.
   std::thread stats_thread;
@@ -744,7 +784,13 @@ struct gcs_grpc_reactor::impl {
     s.ctx = std::make_unique<grpc::ClientContext>();
     // Long-lived multi-range stream: no per-call deadline (channel keepalive
     // detects dead peers); ranges themselves are retried on stream failure.
-    s.ctx->AddMetadata("x-goog-request-params", routing_params(s.handle->bucket));
+    // A pending routing_token (from a Rapid Storage redirect) is appended to
+    // the routing header AND set in the spec on the first write below.
+    auto params = routing_params(s.handle->bucket);
+    if (!s.routing_token.empty()) {
+      params += "&routing_token=" + percent_encode(s.routing_token);
+    }
+    s.ctx->AddMetadata("x-goog-request-params", params);
     s.saw_response = false;
     s.state        = bidi_session::phase::starting;
     s.rw           = s.ln->stub->PrepareAsyncBidiReadObject(s.ctx.get(), &s.ln->cq);
@@ -767,6 +813,10 @@ struct gcs_grpc_reactor::impl {
       spec->set_bucket(bucket_resource(s.handle->bucket));
       spec->set_object(s.handle->key);
       if (s.handle->generation != 0) { spec->set_generation(s.handle->generation); }
+      // Echo redirect state so the server routes to the correct location and
+      // resumes the read without re-validating (Rapid Storage handshake).
+      if (!s.routing_token.empty()) { spec->set_routing_token(s.routing_token); }
+      if (s.read_handle) { spec->mutable_read_handle()->set_handle(*s.read_handle); }
     }
     std::size_t n = 0;
     while (!s.pending.empty() && n < kMaxRangesPerWrite &&
@@ -877,8 +927,20 @@ struct gcs_grpc_reactor::impl {
     }
   }
 
-  /// Terminal handling once Finish completed: retry, fall back or fail all
-  /// ranges the session still holds; erase the session unless it restarts.
+  /// Tear down the current stream so the session can be reopened (retry or
+  /// redirect). Leaves pending/outstanding untouched — the caller requeues.
+  void reset_session_stream(bidi_session& s)
+  {
+    s.rw.reset();
+    s.ctx.reset();
+    s.state         = bidi_session::phase::idle;
+    s.next_read_id  = 1;
+    s.read_inflight = s.write_inflight = false;
+  }
+
+  /// Terminal handling once Finish completed: follow a Rapid Storage redirect,
+  /// retry, fall back or fail all ranges the session still holds; erase the
+  /// session unless it restarts.
   void reap_session(bidi_session& s)
   {
     auto& ln        = *s.ln;
@@ -903,11 +965,54 @@ struct gcs_grpc_reactor::impl {
     bool const probe_failed = !s.saw_response && cfg.bidi_reads == gcs_bidi_mode::automatic &&
                               is_bidi_unsupported(s.status.error_code());
 
+    // Rapid Storage redirect handshake: a zonal bucket aborts the stream with a
+    // routing_token / read_handle we must echo back on reopen so it routes to
+    // the correct location. This is the expected path for Rapid buckets — check
+    // it before the generic retriable-restart branch (ABORTED is retriable, but
+    // restarting WITHOUT the token just re-aborts).
+    // NOTE: routing_token is read via routing_token()/empty() rather than a
+    // has_ accessor — it is a plain proto3 string and generates no has_ method.
+    // read_handle is a message field, so has_read_handle() is always available.
+    std::optional<v2::BidiReadObjectRedirectedError> redirect;
+    if (!stop && !leftovers.empty()) { redirect = extract_bidi_redirect(s.status); }
+    bool const follow_redirect =
+      redirect.has_value() &&
+      (!redirect->routing_token().empty() || redirect->has_read_handle()) &&
+      s.redirects < kMaxBidiRedirects;
+
     if (stop) {
       for (auto& rs : leftovers) {
         fail_range(std::move(rs),
                    std::make_exception_ptr(std::runtime_error("gcs_grpc: reactor shut down")));
       }
+    } else if (follow_redirect) {
+      ++s.redirects;
+      bidi_redirects.fetch_add(1, std::memory_order_relaxed);
+      if (!redirect->routing_token().empty()) { s.routing_token = redirect->routing_token(); }
+      if (redirect->has_read_handle()) { s.read_handle = redirect->read_handle().handle(); }
+      if (!logged_first_redirect.exchange(true)) {
+        SIRIUS_LOG_INFO(
+          "gcs_grpc: Rapid Storage redirect handshake active for bucket={} — reopening "
+          "BidiReadObject with routing_token (this is expected for zonal buckets)",
+          s.handle->bucket);
+      }
+      SIRIUS_LOG_INFO(
+        "gcs_grpc: following BidiReadObject redirect for gs://{}/{} (redirect {}/{}, "
+        "routing_token={}, read_handle={}, {} ranges resuming)",
+        s.handle->bucket,
+        s.handle->key,
+        s.redirects,
+        kMaxBidiRedirects,
+        s.routing_token.empty() ? "<none>" : "<set>",
+        s.read_handle ? "<set>" : "<none>",
+        leftovers.size());
+      reset_session_stream(s);
+      for (auto& rs : leftovers) {
+        s.pending.push_back(std::move(rs));  // resume offsets preserved; not a failure
+      }
+      ln.sessions_waiting.push_back(&s);
+      pump(ln);
+      return;  // session stays in the map
     } else if (probe_failed) {
       {
         std::lock_guard<std::mutex> lk(bidi_mtx);
@@ -942,11 +1047,7 @@ struct gcs_grpc_reactor::impl {
           cfg.max_retry_attempts,
           leftovers.size());
       }
-      s.rw.reset();
-      s.ctx.reset();
-      s.state         = bidi_session::phase::idle;
-      s.next_read_id  = 1;
-      s.read_inflight = s.write_inflight = false;
+      reset_session_stream(s);
       for (auto& rs : leftovers) {
         if (!s.status.ok()) ++rs->attempts;
         s.pending.push_back(std::move(rs));
@@ -956,12 +1057,32 @@ struct gcs_grpc_reactor::impl {
       return;  // session stays in the map
     } else if (!leftovers.empty()) {
       retry_exhausted.fetch_add(leftovers.size(), std::memory_order_relaxed);
-      SIRIUS_LOG_ERROR("gcs_grpc: bidi session gs://{}/{} failed terminally: {} {} ({} ranges)",
-                       s.handle->bucket,
-                       s.handle->key,
-                       static_cast<int>(s.status.error_code()),
-                       s.status.error_message(),
-                       leftovers.size());
+      // A redirect we couldn't follow (no token, or redirect cap hit) almost
+      // always means the client cannot actually reach the bucket's zone — most
+      // commonly a Rapid/zonal bucket accessed without DirectPath from a
+      // co-located VM. Surface that explicitly rather than a bare status code.
+      bool const location_issue =
+        redirect.has_value() || s.status.error_code() == grpc::StatusCode::ABORTED;
+      if (location_issue) {
+        SIRIUS_LOG_ERROR(
+          "gcs_grpc: BidiReadObject gs://{}/{} not available from this location (status={} {}, "
+          "redirects_followed={}). This is a Rapid/zonal bucket routing failure — ensure "
+          "grpc_directpath=true on a co-located GCE VM, or set grpc_bidi_reads=off to force the "
+          "unary path. ({} ranges failed)",
+          s.handle->bucket,
+          s.handle->key,
+          static_cast<int>(s.status.error_code()),
+          s.status.error_message(),
+          s.redirects,
+          leftovers.size());
+      } else {
+        SIRIUS_LOG_ERROR("gcs_grpc: bidi session gs://{}/{} failed terminally: {} {} ({} ranges)",
+                         s.handle->bucket,
+                         s.handle->key,
+                         static_cast<int>(s.status.error_code()),
+                         s.status.error_message(),
+                         leftovers.size());
+      }
       for (auto& rs : leftovers) {
         fail_range(std::move(rs), to_exception(s.status, "BidiReadObject"));
       }
@@ -1035,8 +1156,8 @@ struct gcs_grpc_reactor::impl {
       auto mib  = static_cast<double>(bytes - last_bytes) / (1024.0 * 1024.0);
       SIRIUS_LOG_INFO(
         "gcs_grpc stats: +{:.1f} MiB ({:.1f} MiB/s) | totals: bytes={} ranges={} sg_reads={} "
-        "unary_streams={} bidi_sessions={} bidi_ranges={} bidi_fallbacks={} retries={} "
-        "retry_exhausted={} device_chunks={}",
+        "unary_streams={} bidi_sessions={} bidi_ranges={} bidi_fallbacks={} bidi_redirects={} "
+        "retries={} retry_exhausted={} device_chunks={}",
         mib,
         secs > 0 ? mib / secs : 0.0,
         bytes,
@@ -1046,6 +1167,7 @@ struct gcs_grpc_reactor::impl {
         bidi_sessions_opened.load(std::memory_order_relaxed),
         bidi_ranges.load(std::memory_order_relaxed),
         bidi_fallbacks.load(std::memory_order_relaxed),
+        bidi_redirects.load(std::memory_order_relaxed),
         retries.load(std::memory_order_relaxed),
         retry_exhausted.load(std::memory_order_relaxed),
         device_chunks.load(std::memory_order_relaxed));
@@ -1271,8 +1393,8 @@ void gcs_grpc_reactor::shutdown()
   auto st = stats();
   SIRIUS_LOG_INFO(
     "gcs_grpc: reactor shutdown | totals: bytes={} ranges={} sg_reads={} unary_streams={} "
-    "bidi_sessions={} bidi_ranges={} bidi_fallbacks={} retries={} retry_exhausted={} "
-    "device_chunks={}",
+    "bidi_sessions={} bidi_ranges={} bidi_fallbacks={} bidi_redirects={} retries={} "
+    "retry_exhausted={} device_chunks={}",
     st.bytes_read,
     st.ranges_completed,
     st.sg_reads,
@@ -1280,6 +1402,7 @@ void gcs_grpc_reactor::shutdown()
     st.bidi_sessions,
     st.bidi_ranges,
     st.bidi_fallbacks,
+    st.bidi_redirects,
     st.retries,
     st.retry_exhausted,
     st.device_chunks);
@@ -1296,6 +1419,7 @@ gcs_grpc_reactor::stats_snapshot gcs_grpc_reactor::stats() const noexcept
   s.bidi_sessions    = _impl->bidi_sessions_opened.load(std::memory_order_relaxed);
   s.bidi_ranges      = _impl->bidi_ranges.load(std::memory_order_relaxed);
   s.bidi_fallbacks   = _impl->bidi_fallbacks.load(std::memory_order_relaxed);
+  s.bidi_redirects   = _impl->bidi_redirects.load(std::memory_order_relaxed);
   s.retries          = _impl->retries.load(std::memory_order_relaxed);
   s.retry_exhausted  = _impl->retry_exhausted.load(std::memory_order_relaxed);
   s.device_chunks    = _impl->device_chunks.load(std::memory_order_relaxed);
