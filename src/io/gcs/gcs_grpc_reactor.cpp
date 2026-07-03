@@ -455,6 +455,11 @@ struct gcs_grpc_reactor::impl {
   std::atomic<bool> logged_first_sg{false};
   std::atomic<bool> logged_first_device{false};
   std::atomic<bool> logged_first_redirect{false};
+  std::atomic<bool> logged_bidi_needs_directpath{false};
+
+  /// The gRPC target the channels dial ("google-c2p:///..." or host:443);
+  /// echoed in routing-failure logs so they self-diagnose CFE-vs-DirectPath.
+  std::string channel_target;
 
   // Periodic throughput log.
   std::thread stats_thread;
@@ -531,6 +536,20 @@ struct gcs_grpc_reactor::impl {
   {
     if (cfg.bidi_reads == gcs_bidi_mode::off) return false;
     if (cfg.bidi_reads == gcs_bidi_mode::on) return true;
+    // auto mode: BidiReadObject on zonal buckets is only reachable over
+    // DirectPath — the redirect routing_token is consumed by the client-side
+    // c2p/RLS routing stack, which only exists on a DirectPath channel. Via
+    // the CFE the reopened stream just re-redirects forever (while unary reads
+    // are proxied fine). Don't even probe without DirectPath.
+    if (!cfg.directpath) {
+      if (!logged_bidi_needs_directpath.exchange(true)) {
+        SIRIUS_LOG_WARN(
+          "gcs_grpc: bidi_reads=auto but grpc_directpath=false — using unary ReadObject. "
+          "BidiReadObject (Rapid fast path) requires DirectPath: set grpc_directpath: true on a "
+          "GCE VM co-located with the zonal bucket.");
+      }
+      return false;
+    }
     std::lock_guard<std::mutex> lk(bidi_mtx);
     auto it = bucket_bidi_ok.find(bucket);
     return it == bucket_bidi_ok.end() || it->second;  // unknown -> probe
@@ -1113,24 +1132,30 @@ struct gcs_grpc_reactor::impl {
       pump(ln);
       return;  // session stays in the map
     } else if (!leftovers.empty()) {
+      // A redirect we couldn't resolve (loop hit the cap, or no token) means
+      // the reopened stream never lands on a machine that can serve the zonal
+      // object. The routing_token is honored by the client-side DirectPath
+      // c2p/RLS routing stack — if the channel is actually talking to the CFE
+      // (grpc_directpath=false, or silent c2p fallback), every reopen goes
+      // back to the CFE and re-redirects while unary reads work fine.
+      bool const location_issue = redirect.has_value() || s.redirects > 0 ||
+                                  s.status.error_code() == grpc::StatusCode::ABORTED;
       retry_exhausted.fetch_add(leftovers.size(), std::memory_order_relaxed);
-      // A redirect we couldn't follow (no token, or redirect cap hit) almost
-      // always means the client cannot actually reach the bucket's zone — most
-      // commonly a Rapid/zonal bucket accessed without DirectPath from a
-      // co-located VM. Surface that explicitly rather than a bare status code.
-      bool const location_issue =
-        redirect.has_value() || s.status.error_code() == grpc::StatusCode::ABORTED;
       if (location_issue) {
         SIRIUS_LOG_ERROR(
-          "gcs_grpc: BidiReadObject gs://{}/{} not available from this location (status={} {}, "
-          "redirects_followed={}). This is a Rapid/zonal bucket routing failure — ensure "
-          "grpc_directpath=true on a co-located GCE VM, or set grpc_bidi_reads=off to force the "
-          "unary path. ({} ranges failed)",
+          "gcs_grpc: BidiReadObject gs://{}/{} unresolvable redirect loop (status={} {}, "
+          "redirects_followed={}, directpath={}, target={}). The routing_token is honored by the "
+          "client-side DirectPath xDS/RLS routing — if that stack is not engaging in THIS process "
+          "the reopen keeps landing on the same backend. Verify with tools/gcs_bidi_probe and "
+          "GRPC_TRACE=google_c2p_resolver,rls_lb,xds_client GRPC_VERBOSITY=DEBUG. ({} ranges "
+          "failed)",
           s.handle->bucket,
           s.handle->key,
           static_cast<int>(s.status.error_code()),
           s.status.error_message(),
           s.redirects,
+          cfg.directpath,
+          channel_target,
           leftovers.size());
       } else {
         SIRIUS_LOG_ERROR("gcs_grpc: bidi session gs://{}/{} failed terminally: {} {} ({} ranges)",
@@ -1302,6 +1327,8 @@ gcs_grpc_reactor::gcs_grpc_reactor(config cfg) : _cfg(std::move(cfg))
       target += ":443";  // default gRPC TLS port
     }
   }
+
+  _impl->channel_target = target;
 
   _impl->lanes.reserve(n_lanes);
   for (std::size_t i = 0; i < n_lanes; ++i) {
