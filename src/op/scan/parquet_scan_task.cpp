@@ -863,7 +863,7 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
     auto const preferred_probe =
       local_preferred_probe.has_value() ? local_preferred_probe : g_state.get_preferred_device_id();
     auto* memspace_probe = l_state.get_memory_space();
-    SIRIUS_LOG_INFO(
+    SIRIUS_LOG_TRACE(
       "[mgpu-probe] parquet_scan_task::compute_task entry current_device={} stream={} "
       "preferred_device_id={} memspace_device_id={}",
       current_device,

@@ -94,7 +94,7 @@ convert_host_parquet_to_gpu_with_prefetched_data_source(
   {
     int current_device = -1;
     (void)cudaGetDevice(&current_device);
-    SIRIUS_LOG_INFO(
+    SIRIUS_LOG_TRACE(
       "[mgpu-probe] host_parquet_to_gpu entry current_device={} stream={} "
       "target_device_id={} memspace_device_id={}",
       current_device,
@@ -181,7 +181,7 @@ convert_host_parquet_to_gpu_with_prefetched_data_source(
   {
     int current_device_exit = -1;
     (void)cudaGetDevice(&current_device_exit);
-    SIRIUS_LOG_INFO(
+    SIRIUS_LOG_TRACE(
       "[mgpu-probe] host_parquet_to_gpu exit current_device={} target_stream={} "
       "target_device_id={}",
       current_device_exit,
