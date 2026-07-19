@@ -161,7 +161,12 @@ std::unique_ptr<op::operator_data> run_one_operator(
   nvtx3::scoped_range nvtx_range{nvtx_label.c_str()};
   auto start                = std::chrono::high_resolution_clock::now();
   auto operator_output_data = op.execute(operator_input_data, stream);
-  stream.synchronize();
+  // Sync ONLY when the per-operator timing TRACE lines are actually emitted:
+  // the sync exists so `duration` includes kernel completion (log accuracy),
+  // not for correctness — downstream work is ordered by the stream itself, and
+  // peak_bytes is a host-side counter updated at allocate() time. Blocking the
+  // worker thread here at INFO level costs real overlap, especially multi-GPU.
+  if (spdlog::default_logger_raw()->should_log(spdlog::level::trace)) { stream.synchronize(); }
   auto end      = std::chrono::high_resolution_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
 
@@ -386,9 +391,10 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
 
   try {
     local_state._input_data->prepare_for_processing(requested_memory_space, stream);
-    // synchronizing here to ensure the timing collected by Quent and logging for preparing the task
-    // is accurate.
-    stream.synchronize();
+    // Sync ONLY when the prepare-timing TRACE line is actually emitted (the
+    // sync exists purely so the logged prepare time includes device work —
+    // see the sibling gate after op.execute above).
+    if (spdlog::default_logger_raw()->should_log(spdlog::level::trace)) { stream.synchronize(); }
   } catch (const rmm::out_of_memory& oom) {
     auto peak_bytes  = allocator->get_peak_allocated_bytes(stream);
     auto input_basis = local_state.get_reservation_size_info()->input_basis;

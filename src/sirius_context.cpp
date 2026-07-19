@@ -835,20 +835,25 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     // local read path) and the s3_ioctx. Skip the per-NUMA urings when the
     // sirius local read path is disabled — local reads will go through
     // cudf::io::datasource::create and never touch this cache.
+    // With chunk prewarm disabled the cache never holds chunk DATA, so the
+    // bulk SG data reads can skip the per-range cache probe entirely
+    // (cache_data_reads=false); footer/size caching is unaffected.
+    bool const cache_data_reads = scan_cfg.enable_chunk_prewarm;
     if (scan_cfg.use_sirius_datasource) {
       for (auto& kv : numa_ioctxs_) {
         if (kv.second) {
-          kv.second->initialize_cache(*prefetch_buffer_pool_,
-                                      scan_cfg.prefetch_inflight_budget_chunks);
+          kv.second->initialize_cache(
+            *prefetch_buffer_pool_, scan_cfg.prefetch_inflight_budget_chunks, cache_data_reads);
         }
       }
     }
     if (s3_ioctx_) {
-      s3_ioctx_->initialize_cache(*prefetch_buffer_pool_, scan_cfg.prefetch_inflight_budget_chunks);
+      s3_ioctx_->initialize_cache(
+        *prefetch_buffer_pool_, scan_cfg.prefetch_inflight_budget_chunks, cache_data_reads);
     }
     if (gcs_ioctx_) {
-      gcs_ioctx_->initialize_cache(*prefetch_buffer_pool_,
-                                   scan_cfg.prefetch_inflight_budget_chunks);
+      gcs_ioctx_->initialize_cache(
+        *prefetch_buffer_pool_, scan_cfg.prefetch_inflight_budget_chunks, cache_data_reads);
     }
   }
 
@@ -871,12 +876,15 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
       1,
       static_cast<uint32_t>((scan_cfg.metadata_cache_pool_bytes + slab_bytes - 1) / slab_bytes));
     prefetch_buffer_pool_ = std::make_unique<sirius::io::buffer_pool>(*host_fsmr, max_slabs);
+    // Metadata-only mode: chunk data is never cached, so SG data reads skip
+    // the cache probe (cache_data_reads=false).
     if (s3_ioctx_) {
-      s3_ioctx_->initialize_cache(*prefetch_buffer_pool_, scan_cfg.prefetch_inflight_budget_chunks);
+      s3_ioctx_->initialize_cache(
+        *prefetch_buffer_pool_, scan_cfg.prefetch_inflight_budget_chunks, false);
     }
     if (gcs_ioctx_) {
-      gcs_ioctx_->initialize_cache(*prefetch_buffer_pool_,
-                                   scan_cfg.prefetch_inflight_budget_chunks);
+      gcs_ioctx_->initialize_cache(
+        *prefetch_buffer_pool_, scan_cfg.prefetch_inflight_budget_chunks, false);
     }
     SIRIUS_LOG_INFO(
       "SiriusContext: metadata-only footer cache enabled for network backend(s) "

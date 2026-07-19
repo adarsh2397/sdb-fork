@@ -38,9 +38,12 @@ namespace sirius::io {
 sirius_ioctx::sirius_ioctx()  = default;
 sirius_ioctx::~sirius_ioctx() = default;
 
-void sirius_ioctx::initialize_cache(buffer_pool& pool, size_t inflight_budget_chunks)
+void sirius_ioctx::initialize_cache(buffer_pool& pool,
+                                    size_t inflight_budget_chunks,
+                                    bool cache_data_reads)
 {
-  _cache = std::make_unique<prefetching_cache>(pool, this, inflight_budget_chunks);
+  _cache            = std::make_unique<prefetching_cache>(pool, this, inflight_budget_chunks);
+  _cache_data_reads = cache_data_reads;
 }
 
 namespace {
@@ -219,7 +222,11 @@ std::future<size_t> sirius_ioctx::host_read_segments_async(
   for (auto const& s : segments)
     total += s.size();
 
-  if (_cache && total > 0) {
+  // Skip the lookup when the cache can never hold chunk data (prewarm off) —
+  // this is the per-range hot path of the parquet scan, and the mutex+map
+  // probe is pure overhead in that mode. Footer/metadata reads go through
+  // host_read/host_read_async, which always consult.
+  if (_cache && _cache_data_reads && total > 0) {
     if (auto view = _cache->read(obj, offset, total, nullptr); view) {
       auto slices = view.slice(offset, total);
       try {

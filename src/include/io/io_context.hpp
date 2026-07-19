@@ -72,7 +72,15 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
   /// Construct the owned prefetching_cache.  Must be called before any
   /// read that should consult the cache; until then device_read falls
   /// through directly to device_read_io.
-  void initialize_cache(buffer_pool& pool, size_t inflight_budget_chunks = 2048);
+  ///
+  /// @param cache_data_reads  When false, bulk scatter-gather DATA reads
+  ///   (host_read_segments_async — the parquet column-chunk hot path) skip the
+  ///   cache lookup entirely: with chunk prewarm disabled the cache never
+  ///   holds chunk data, so the per-range lookup (mutex + map) can never hit.
+  ///   Footer/metadata reads (host_read / host_read_async) always consult.
+  void initialize_cache(buffer_pool& pool,
+                        size_t inflight_budget_chunks = 2048,
+                        bool cache_data_reads         = true);
 
   [[nodiscard]] prefetching_cache* cache() noexcept { return _cache.get(); }
 
@@ -143,6 +151,8 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
 
  protected:
   std::unique_ptr<prefetching_cache> _cache;
+  /// See initialize_cache(): false = SG data reads bypass the cache lookup.
+  bool _cache_data_reads{true};
 };
 
 }  // namespace sirius::io
