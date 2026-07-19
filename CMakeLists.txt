@@ -185,6 +185,7 @@ set(EXTENSION_SOURCES
     src/io/gcs/gcs_async_ioctx.cpp
     src/io/gcs/gcs_grpc_ioctx.cpp
     src/io/gcs/gcs_grpc_reactor.cpp
+    src/io/gcs/gcs_wire.cpp
     src/io/gcs/gcs_oauth2_authorizer.cpp
     src/io/s3/s3_blocking_ioctx.cpp
     src/io/s3/s3_reactor.cpp
@@ -485,6 +486,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_tpch_mgpu_audit.cpp
     test/cpp/integration/test_table_gpu_cache_warm_mgpu.cpp
     test/cpp/integration/test_transparent_execution.cpp
+    test/cpp/io/test_gcs_wire.cpp
     test/cpp/io/s3/test_sigv4.cpp
     test/cpp/io/s3/test_s3_default_visibility_guard.cpp
     test/cpp/io/s3/test_s3_blocking_ioctx.cpp
