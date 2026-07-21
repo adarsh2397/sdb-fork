@@ -119,6 +119,21 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
    */
   gpu_pipeline_task* cast_to_gpu_pipeline_task(sirius::parallel::itask* task);
 
+  /**
+   * @brief Acquire this task's GPU memory reservation (with downgrade retry) and
+   * store it on the task's local state. Runs ON THE POOL WORKER THREAD (inside
+   * the dispatched lambda), NOT the single manager thread — so the reservation
+   * for one task overlaps the compute of others instead of serializing task
+   * launch. Backpressure is preserved: a task only reaches here after the
+   * manager reserved a pool slot, so in-flight reservations stay bounded by
+   * num_threads and remain downgrade-visible.
+   *
+   * @return true if a reservation was acquired and set; false if it failed
+   *   (report_error already invoked / downgrade cancelled) and the caller must
+   *   skip execute().
+   */
+  bool acquire_and_set_reservation(gpu_pipeline_task* gpu_task);
+
   cucascade::memory::exclusive_stream_pool _stream_pool;
   exec::publisher<std::unique_ptr<task_request>> _task_request_publisher;
   cucascade::memory::memory_space* _memory_space;
