@@ -432,6 +432,13 @@ struct gcs_grpc_reactor::impl {
   // Bidi availability per bucket: absent = unknown (auto probes), value = known.
   std::mutex bidi_mtx;
   std::unordered_map<std::string, bool> bucket_bidi_ok;
+  // Per-bucket routing_token cache (guarded by bidi_mtx). The routing_token is a
+  // bucket/zone-level routing hint (NOT per-object — unlike read_handle), so once
+  // the first object in a bucket learns it via a redirect, every later session
+  // (this query and future queries in-process) seeds its FIRST request with it
+  // and skips the redirect handshake entirely. A stale token just triggers one
+  // more redirect, which refreshes the cache — self-healing, no TTL needed.
+  std::unordered_map<std::string, std::string> bucket_routing_token;
 
   // Bounded pinned-staging window for the device path.
   std::counting_semaphore<> device_slots{0};
@@ -588,6 +595,17 @@ struct gcs_grpc_reactor::impl {
       s->ln             = &ln;
       s->handle         = rs->handle;
       s->map_key        = key;
+      // Seed the routing_token from the per-bucket cache so this session's very
+      // first request already carries it and skips the redirect handshake. Only
+      // the first object in a bucket pays the redirect; everything after (incl.
+      // subsequent queries) starts pre-routed.
+      {
+        std::lock_guard<std::mutex> lk(bidi_mtx);
+        if (auto it = bucket_routing_token.find(rs->handle->bucket);
+            it != bucket_routing_token.end()) {
+          s->routing_token = it->second;
+        }
+      }
       s->start_tag.s    = s.get();
       s->start_tag.kind = bidi_tag::START;
       s->read_tag.s     = s.get();
@@ -1064,7 +1082,13 @@ struct gcs_grpc_reactor::impl {
     } else if (follow_redirect) {
       ++s.redirects;
       bidi_redirects.fetch_add(1, std::memory_order_relaxed);
-      if (!redirect->routing_token().empty()) { s.routing_token = redirect->routing_token(); }
+      if (!redirect->routing_token().empty()) {
+        s.routing_token = redirect->routing_token();
+        // Publish to the per-bucket cache so future sessions (this query and
+        // later ones) skip the redirect by seeding this token up front.
+        std::lock_guard<std::mutex> lk(bidi_mtx);
+        bucket_routing_token[s.handle->bucket] = s.routing_token;
+      }
       if (redirect->has_read_handle()) { s.read_handle = redirect->read_handle().handle(); }
       if (!logged_first_redirect.exchange(true)) {
         SIRIUS_LOG_INFO(
