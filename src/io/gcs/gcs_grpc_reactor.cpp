@@ -976,7 +976,7 @@ struct gcs_grpc_reactor::impl {
         pump_session_writes(s);
         return;
 
-      case bidi_tag::READ:
+      case bidi_tag::READ: {
         if (!ok) {
           s.read_inflight = false;
           if (s.state != bidi_session::phase::finishing) {
@@ -1046,6 +1046,7 @@ struct gcs_grpc_reactor::impl {
           release_slot(ln);
         }
         return;
+      }
 
       case bidi_tag::FINISH:
         // Finish is only ever posted with no read/write outstanding, so this
