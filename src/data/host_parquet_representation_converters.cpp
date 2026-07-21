@@ -166,7 +166,34 @@ convert_host_parquet_to_gpu_with_prefetched_data_source(
     table = host_src.apply_partition_inject(std::move(table), target_stream);
   }
 
-  target_stream.synchronize();
+  // Order the caller's compute stream AFTER this conversion without blocking the
+  // host. The read_parquet + inject chain all ran on `target_stream`; the
+  // consumer (parquet_scan_operator_data::prepare_for_processing ->
+  // convert_to<...>(..., stream)) later reads this table on exactly the `stream`
+  // passed into this converter. So instead of `target_stream.synchronize()` — a
+  // full HOST block that stalled the pipeline pool thread until the GPU drained
+  // (serializing batch N's decode against batch N+1's H2D) — record an event on
+  // the writer stream and make the compute stream wait on it GPU-side. The pool
+  // thread returns immediately, so decode(N) now overlaps H2D(N+1).
+  //
+  // The cross-device peer-copy consumer (cucascade::convert_gpu_to_gpu) does NOT
+  // rely on this: the gpu_table_representation constructed below is born with its
+  // own writer event on `target_stream` (see make_data_batch's STREAM-LINEAGE
+  // contract), which that path waits on independently.
+  cudaEvent_t convert_done = nullptr;
+  if (cudaEventCreateWithFlags(&convert_done, cudaEventDisableTiming) == cudaSuccess) {
+    cudaEventRecord(convert_done, target_stream.value());
+    // GPU-side dependency: `stream` will not begin reading the table until the
+    // conversion completes. Cross-device is supported (same pattern as
+    // convert_gpu_to_gpu); destroy is safe post-enqueue (deferred by the driver
+    // until the wait resolves).
+    cudaStreamWaitEvent(stream.value(), convert_done, 0);
+    cudaEventDestroy(convert_done);
+  } else {
+    // Event creation failed — fall back to the conservative host sync so
+    // correctness never depends on the fast path.
+    target_stream.synchronize();
+  }
 
   // Consume any sticky CUDA state before returning so a later call-site does
   // not surface a stray error against us (matches Pattern 2 hygiene).
