@@ -20,8 +20,13 @@
 #include "log/logging.hpp"
 
 #include <grpcpp/alarm.h>
+#include <grpcpp/generic/generic_stub.h>
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/security/credentials.h>
+#include <grpcpp/support/byte_buffer.h>
+#include <grpcpp/support/slice.h>
+
+#include "io/gcs/gcs_wire.hpp"
 
 #include "google/rpc/status.pb.h"
 #include "google/storage/v2/storage.grpc.pb.h"
@@ -315,10 +320,12 @@ struct gcs_grpc_reactor::impl {
     std::string map_key;
 
     std::unique_ptr<grpc::ClientContext> ctx;
-    std::unique_ptr<
-      grpc::ClientAsyncReaderWriter<v2::BidiReadObjectRequest, v2::BidiReadObjectResponse>>
-      rw;
-    v2::BidiReadObjectResponse resp;
+    // Generic ByteBuffer reader-writer (via lane.generic_stub): request is a
+    // serialized BidiReadObjectRequest, response is the raw serialized
+    // BidiReadObjectResponse that gcs_wire walks without a protobuf parse-copy.
+    std::unique_ptr<grpc::ClientAsyncReaderWriter<grpc::ByteBuffer, grpc::ByteBuffer>> rw;
+    grpc::ByteBuffer resp;
+    grpc::ByteBuffer write_buf;  // kept alive for the duration of an async Write
     grpc::Status status;
 
     enum class phase { idle, starting, ready, closing, finishing } state{phase::idle};
@@ -358,6 +365,12 @@ struct gcs_grpc_reactor::impl {
     std::size_t index{0};
     std::shared_ptr<grpc::Channel> channel;
     std::unique_ptr<v2::Storage::Stub> stub;
+    // Generic (ByteBuffer) stub used ONLY for the bidi read fast path: it lets
+    // us receive raw serialized BidiReadObjectResponse bytes and skip protobuf's
+    // parse-copy of ChecksummedData.content (gcs_wire extracts the content spans
+    // straight into the pinned destination). Unary ReadObject keeps the typed
+    // `stub`.
+    std::unique_ptr<grpc::GenericStub> generic_stub;
     grpc::CompletionQueue cq;
     std::thread worker;
 
@@ -865,7 +878,11 @@ struct gcs_grpc_reactor::impl {
     s.ctx->AddMetadata("x-goog-request-params", params);
     s.saw_response = false;
     s.state        = bidi_session::phase::starting;
-    s.rw           = s.ln->stub->PrepareAsyncBidiReadObject(s.ctx.get(), &s.ln->cq);
+    // Generic-stub call (ByteBuffer both ways) instead of the typed
+    // PrepareAsyncBidiReadObject, so responses arrive as raw bytes for gcs_wire.
+    // Method path is the fully-qualified google.storage.v2 RPC name.
+    s.rw = s.ln->generic_stub->PrepareCall(
+      s.ctx.get(), "/google.storage.v2.Storage/BidiReadObject", &s.ln->cq);
     s.rw->StartCall(&s.start_tag);
     bidi_sessions_opened.fetch_add(1, std::memory_order_relaxed);
   }
@@ -904,8 +921,22 @@ struct gcs_grpc_reactor::impl {
       ++n;
     }
     if (n == 0) return;
+    // Serialize the typed request into the generic ByteBuffer writer. write_buf
+    // is a session member so it stays alive for the async Write (write_inflight
+    // guarantees a single outstanding write, so one buffer is enough).
+    std::string payload;
+    if (!req.SerializeToString(&payload)) {
+      SIRIUS_LOG_ERROR("gcs_grpc: failed to serialize BidiReadObjectRequest for gs://{}/{}",
+                       s.handle->bucket,
+                       s.handle->key);
+      s.state = bidi_session::phase::closing;
+      maybe_finish(s);
+      return;
+    }
+    grpc::Slice slice(payload.data(), payload.size());
+    s.write_buf      = grpc::ByteBuffer(&slice, 1);
     s.write_inflight = true;
-    s.rw->Write(req, &s.write_tag);
+    s.rw->Write(s.write_buf, &s.write_tag);
   }
 
   /// Issue Finish once no read/write is outstanding on a broken stream.
@@ -960,16 +991,41 @@ struct gcs_grpc_reactor::impl {
             mark_bidi_supported(s.handle->bucket);
           }
         }
-        for (auto const& rd : s.resp.object_data_ranges()) {
-          if (!rd.has_read_range()) continue;
-          auto rid = rd.read_range().read_id();
-          auto it  = s.outstanding.find(rid);
+        // Walk the raw response bytes with gcs_wire (no protobuf parse-copy of
+        // content): Dump the ByteBuffer's slices, extract per-range content
+        // spans + control (read_id, range_end), and append content straight
+        // from the wire slices into the destination pinned segments.
+        std::vector<grpc::Slice> raw_slices;
+        (void)s.resp.Dump(&raw_slices);
+        std::vector<sirius::io::gcs::wire::byte_view> views;
+        views.reserve(raw_slices.size());
+        for (auto const& sl : raw_slices) {
+          views.emplace_back(sl.begin(), sl.size());
+        }
+        auto ex = sirius::io::gcs::wire::extract_bidi_read_object_response(views);
+        if (!ex.ok) {
+          // Malformed frame — cannot recover ranges from this message. Treat the
+          // stream as broken; retry/restart resumes the outstanding ranges.
+          SIRIUS_LOG_ERROR(
+            "gcs_grpc: gcs_wire failed to parse BidiReadObjectResponse gs://{}/{}; closing stream",
+            s.handle->bucket,
+            s.handle->key);
+          s.read_inflight = false;
+          s.state         = bidi_session::phase::closing;
+          maybe_finish(s);
+          return;
+        }
+        for (auto const& rng : ex.ranges) {
+          if (!rng.has_read_id) continue;
+          auto it = s.outstanding.find(rng.read_id);
           if (it == s.outstanding.end()) continue;  // stale/duplicated range data
-          if (rd.has_checksummed_data()) {
-            auto const& content = rd.checksummed_data().content();
-            it->second->append(content.data(), content.size());
+          for (auto const& ext : rng.content) {
+            sirius::io::gcs::wire::for_each_span(
+              views, ext, [&](std::uint8_t const* p, std::size_t nbytes) {
+                it->second->append(p, nbytes);
+              });
           }
-          if (rd.range_end() || it->second->remaining() == 0) {
+          if (rng.range_end || it->second->remaining() == 0) {
             complete_range(std::move(it->second));
             s.outstanding.erase(it);
           }
@@ -1370,8 +1426,9 @@ gcs_grpc_reactor::gcs_grpc_reactor(config cfg) : _cfg(std::move(cfg))
     args.SetInt(GRPC_ARG_KEEPALIVE_TIME_MS, 30000);
     args.SetInt(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, 10000);
 
-    ln->channel = grpc::CreateCustomChannel(target, channel_creds, args);
-    ln->stub    = v2::Storage::NewStub(ln->channel);
+    ln->channel      = grpc::CreateCustomChannel(target, channel_creds, args);
+    ln->stub         = v2::Storage::NewStub(ln->channel);
+    ln->generic_stub = std::make_unique<grpc::GenericStub>(ln->channel);
     _impl->lanes.push_back(std::move(ln));
   }
 
