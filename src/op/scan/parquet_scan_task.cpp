@@ -348,6 +348,11 @@ void parquet_scan_task_global_state::initialize_from_files()
     _file_io_objects.push_back(std::move(io_object));
     datasources.push_back(std::move(datasource));
 
+    // Observability: this path reads the footer UNCONDITIONALLY (no cache
+    // check). If this line appears for gs:// files, the uncached scan-task
+    // footer path is active on the GCS hot path (it uses a local-uring ioctx,
+    // so it is expected only for local files — confirm from these logs).
+    SIRIUS_LOG_INFO("[footer-uncached] scan_task_global_state fetching footer file={}", file_path);
 #if CUDF_VERSION_NUM >= 2604
     footer_buffers.push_back(cudf::io::parquet::fetch_footer_to_host(*datasources.back()));
     auto const footer_len = footer_buffers.back()->size();

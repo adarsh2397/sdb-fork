@@ -465,10 +465,15 @@ void parquet_split_provider::run_batch(file_batch const& batch,
     }
 
     if (cached_parquet_metadata) {
+      SIRIUS_LOG_INFO("[footer-cache] HIT split_provider file={} (no footer read)", file_path);
       file_metadata   = cached_parquet_metadata->file_metadata();
       footer_byte_len = cached_parquet_metadata->footer_byte_len();
       reader_ptr = std::make_unique<op::scan::hybrid_scan_reader>(*file_metadata, *reader_options);
     } else {
+      SIRIUS_LOG_INFO(
+        "[footer-cache] MISS split_provider file={} cache_present={} — fetching footer from backend",
+        file_path,
+        (file_io_ctx && file_io_ctx->cache() != nullptr));
       auto footer_buffer = cudf::io::parquet::fetch_footer_to_host(*datasource);
       footer_byte_len    = footer_buffer->size();
       reader_ptr         = std::make_unique<op::scan::hybrid_scan_reader>(
